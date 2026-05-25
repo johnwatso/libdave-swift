@@ -2,7 +2,7 @@ import Foundation
 import CDave
 
 /// Opaque wrapper for a DAVE Key Ratchet.
-public class DaveKeyRatchet {
+public final class DaveKeyRatchet: @unchecked Sendable {
     internal let handle: DAVEKeyRatchetHandle
 
     internal init(handle: DAVEKeyRatchetHandle) {
@@ -15,7 +15,7 @@ public class DaveKeyRatchet {
 }
 
 /// Opaque wrapper for the result of an MLS commit process.
-public class DaveCommitResult {
+public final class DaveCommitResult: @unchecked Sendable {
     internal let handle: DAVECommitResultHandle?
 
     internal init(handle: DAVECommitResultHandle?) {
@@ -66,7 +66,7 @@ public class DaveCommitResult {
 }
 
 /// Opaque wrapper for the result of processing an MLS welcome message.
-public class DaveWelcomeResult {
+public final class DaveWelcomeResult: @unchecked Sendable {
     internal let handle: DAVEWelcomeResultHandle
 
     internal init(handle: DAVEWelcomeResultHandle) {
@@ -101,7 +101,7 @@ public class DaveWelcomeResult {
 }
 
 /// A DAVE session handle managing group encryption state and MLS protocol integration.
-public class DaveSession {
+public final class DaveSession: @unchecked Sendable {
     internal let handle: DAVESessionHandle
     private let bridgePointer: UnsafeMutableRawPointer
 
@@ -114,7 +114,7 @@ public class DaveSession {
     /// - Parameters:
     ///   - authSessionId: Identifier used to manage persistent key lifetimes.
     ///   - onMLSFailure: Callback invoked when an MLS failure occurs.
-    public init(authSessionId: String? = nil, onMLSFailure: @escaping (String, String) -> Void) throws {
+    public init(authSessionId: String? = nil, onMLSFailure: @escaping @Sendable (String, String) -> Void) throws {
         let bridge = DaveSessionCallbackBridge()
         bridge.onMLSFailure = onMLSFailure
         let bridgePtr = Unmanaged.passRetained(bridge).toOpaque()
@@ -267,7 +267,7 @@ public class DaveSession {
     public func getPairwiseFingerprint(
         version: UInt16,
         userId: String,
-        callback: @escaping (Data) -> Void
+        callback: @escaping @Sendable (Data) -> Void
     ) {
         let bridge = Unmanaged<DaveSessionCallbackBridge>.fromOpaque(bridgePointer).takeUnretainedValue()
         bridge.onPairwiseFingerprint = callback

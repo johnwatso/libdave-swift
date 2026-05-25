@@ -2,9 +2,10 @@ import Foundation
 import CDave
 
 /// An encryptor for media frames (audio/video) in a DAVE session.
-public class DaveEncryptor {
+public final class DaveEncryptor: @unchecked Sendable {
     internal let handle: DAVEEncryptorHandle
     private var bridgePointer: UnsafeMutableRawPointer? = nil
+    private let lock = NSLock()
 
     /// Creates a new media frame encryptor.
     public init() throws {
@@ -92,7 +93,10 @@ public class DaveEncryptor {
     }
 
     /// Sets a callback to be notified when the protocol version changes.
-    public func setProtocolVersionChangedCallback(_ callback: @escaping () -> Void) {
+    public func setProtocolVersionChangedCallback(_ callback: @escaping @Sendable () -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+
         if let oldBridgePtr = bridgePointer {
             Unmanaged<DaveEncryptorCallbackBridge>.fromOpaque(oldBridgePtr).release()
         }

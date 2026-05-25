@@ -1,20 +1,34 @@
 import Foundation
 import CDave
 
-/// Internal bridge class to store the global logger closure.
-internal class DaveLogCallbackBridge {
+/// Internal bridge class to store the global logger closure safely.
+internal final class DaveLogCallbackBridge: @unchecked Sendable {
     let minSeverity: DaveLoggingSeverity
-    let callback: (DaveLoggingSeverity, String, Int, String) -> Void
+    let callback: @Sendable (DaveLoggingSeverity, String, Int, String) -> Void
 
-    init(minSeverity: DaveLoggingSeverity, callback: @escaping (DaveLoggingSeverity, String, Int, String) -> Void) {
+    init(minSeverity: DaveLoggingSeverity, callback: @escaping @Sendable (DaveLoggingSeverity, String, Int, String) -> Void) {
         self.minSeverity = minSeverity
         self.callback = callback
     }
 }
 
 /// Global logging manager for the DAVE library.
-public class DaveLogger {
-    private static var activeBridge: DaveLogCallbackBridge? = nil
+public final class DaveLogger: @unchecked Sendable {
+    private static let lock = NSLock()
+    private static var _activeBridge: DaveLogCallbackBridge? = nil
+
+    private static var activeBridge: DaveLogCallbackBridge? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _activeBridge
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            _activeBridge = newValue
+        }
+    }
 
     /// Sets a global callback to receive log messages from the DAVE library.
     /// - Parameters:
@@ -22,7 +36,7 @@ public class DaveLogger {
     ///   - callback: A closure invoked for each log message, providing severity, source file, line number, and message.
     public static func setLogSink(
         minSeverity: DaveLoggingSeverity = .info,
-        callback: @escaping (DaveLoggingSeverity, String, Int, String) -> Void
+        callback: @escaping @Sendable (DaveLoggingSeverity, String, Int, String) -> Void
     ) {
         let bridge = DaveLogCallbackBridge(minSeverity: minSeverity, callback: callback)
         DaveLogger.activeBridge = bridge

@@ -2,7 +2,7 @@ import Foundation
 import CDave
 
 /// Supported media codecs for encryption.
-public enum DaveCodec: UInt32, Codable, CustomStringConvertible {
+public enum DaveCodec: UInt32, Codable, Sendable, CustomStringConvertible {
     case unknown = 0
     case opus = 1
     case vp8 = 2
@@ -33,7 +33,7 @@ public enum DaveCodec: UInt32, Codable, CustomStringConvertible {
 }
 
 /// Media stream type classification.
-public enum DaveMediaType: UInt32, Codable, CustomStringConvertible {
+public enum DaveMediaType: UInt32, Codable, Sendable, CustomStringConvertible {
     case audio = 0
     case video = 1
 
@@ -54,7 +54,7 @@ public enum DaveMediaType: UInt32, Codable, CustomStringConvertible {
 }
 
 /// Severity levels for logging.
-public enum DaveLoggingSeverity: UInt32, Codable, CustomStringConvertible {
+public enum DaveLoggingSeverity: UInt32, Codable, Sendable, CustomStringConvertible {
     case verbose = 0
     case info = 1
     case warning = 2
@@ -80,38 +80,8 @@ public enum DaveLoggingSeverity: UInt32, Codable, CustomStringConvertible {
     }
 }
 
-/// Errors thrown by the LibDave module.
-public enum DaveError: Error, LocalizedError {
-    case sessionCreationFailed
-    case encryptorCreationFailed
-    case decryptorCreationFailed
-    case encryptionFailed(reason: DaveEncryptorResultCode)
-    case decryptionFailed(reason: DaveDecryptorResultCode)
-    case bufferTooSmall
-    case invalidState(message: String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .sessionCreationFailed:
-            return "Failed to create DAVE session."
-        case .encryptorCreationFailed:
-            return "Failed to create media frame encryptor."
-        case .decryptorCreationFailed:
-            return "Failed to create media frame decryptor."
-        case .encryptionFailed(let reason):
-            return "Media frame encryption failed with result: \(reason.description)"
-        case .decryptionFailed(let reason):
-            return "Media frame decryption failed with result: \(reason.description)"
-        case .bufferTooSmall:
-            return "The destination buffer capacity was insufficient."
-        case .invalidState(let message):
-            return "Invalid state: \(message)"
-        }
-    }
-}
-
 /// Result codes returned by encryption operations.
-public enum DaveEncryptorResultCode: UInt32, Error, CustomStringConvertible {
+public enum DaveEncryptorResultCode: UInt32, Error, Sendable, CustomStringConvertible {
     case success = 0
     case encryptionFailure = 1
     case missingKeyRatchet = 2
@@ -134,7 +104,7 @@ public enum DaveEncryptorResultCode: UInt32, Error, CustomStringConvertible {
 }
 
 /// Result codes returned by decryption operations.
-public enum DaveDecryptorResultCode: UInt32, Error, CustomStringConvertible {
+public enum DaveDecryptorResultCode: UInt32, Error, Sendable, CustomStringConvertible {
     case success = 0
     case decryptionFailure = 1
     case missingKeyRatchet = 2
@@ -156,8 +126,53 @@ public enum DaveDecryptorResultCode: UInt32, Error, CustomStringConvertible {
     }
 }
 
+/// Errors thrown by the LibDave module.
+public enum DaveError: Error, LocalizedError, Sendable {
+    case sessionCreationFailed
+    case encryptorCreationFailed
+    case decryptorCreationFailed
+    case handshakeFailed(reason: String)
+    case protocolMismatch(expected: UInt16, actual: UInt16)
+    case invalidTransition(message: String)
+    case ratchetFailed(userId: String, reason: String)
+    case encryptionFailed(reason: DaveEncryptorResultCode)
+    case decryptionFailed(reason: DaveDecryptorResultCode)
+    case bufferTooSmall
+    case invalidState(message: String)
+    case notConfigured
+
+    public var errorDescription: String? {
+        switch self {
+        case .sessionCreationFailed:
+            return "Failed to create DAVE session."
+        case .encryptorCreationFailed:
+            return "Failed to create media frame encryptor."
+        case .decryptorCreationFailed:
+            return "Failed to create media frame decryptor."
+        case .handshakeFailed(let reason):
+            return "DAVE handshake failed: \(reason)"
+        case .protocolMismatch(let expected, let actual):
+            return "DAVE protocol version mismatch: expected version \(expected), but got \(actual)."
+        case .invalidTransition(let message):
+            return "Invalid transition occurred: \(message)"
+        case .ratchetFailed(let userId, let reason):
+            return "Failed to transition key ratchet for user '\(userId)': \(reason)"
+        case .encryptionFailed(let reason):
+            return "Media frame encryption failed: \(reason.description)"
+        case .decryptionFailed(let reason):
+            return "Media frame decryption failed: \(reason.description)"
+        case .bufferTooSmall:
+            return "The destination buffer capacity was insufficient."
+        case .invalidState(let message):
+            return "Invalid session state: \(message)"
+        case .notConfigured:
+            return "DAVE Session Coordinator is not configured. Please call configureForDiscordVoice first."
+        }
+    }
+}
+
 /// Statistics for encryption operations.
-public struct DaveEncryptorStats: Codable {
+public struct DaveEncryptorStats: Codable, Sendable {
     public let passthroughCount: UInt64
     public let encryptSuccessCount: UInt64
     public let encryptFailureCount: UInt64
@@ -178,7 +193,7 @@ public struct DaveEncryptorStats: Codable {
 }
 
 /// Statistics for decryption operations.
-public struct DaveDecryptorStats: Codable {
+public struct DaveDecryptorStats: Codable, Sendable {
     public let passthroughCount: UInt64
     public let decryptSuccessCount: UInt64
     public let decryptFailureCount: UInt64

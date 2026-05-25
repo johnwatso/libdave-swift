@@ -2,7 +2,7 @@ import Foundation
 import CDave
 
 /// A decryptor for media frames (audio/video) in a DAVE session.
-public class DaveDecryptor {
+public final class DaveDecryptor: @unchecked Sendable {
     internal let handle: DAVEDecryptorHandle
 
     /// Creates a new media frame decryptor.
