@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "LibDave",
+    name: "libdave-swift",
     platforms: [
         .macOS(.v10_15),
         .iOS(.v13)

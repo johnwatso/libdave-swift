@@ -9,6 +9,10 @@ final class LibDaveTests: XCTestCase {
         print("Max Supported Protocol Version: \(version)")
     }
 
+    func testLibDaveVersion() {
+        XCTAssertEqual(LibDaveVersion, "1.0.0", "Version constant should be '1.0.0'")
+    }
+
     func testSessionCreationAndInitialization() {
         var failureLogged = false
         var failureSource = ""

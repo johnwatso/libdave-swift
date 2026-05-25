@@ -27,7 +27,7 @@ Add the dependency to your project in Xcode, or append it to your `Package.swift
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/johnwatso/libdave-swift.git", branch: "main")
+    .package(url: "https://github.com/johnwatso/libdave-swift.git", from: "1.0.0")
 ]
 ```
 
@@ -36,7 +36,9 @@ Then add the product target `LibDave` as a dependency in your application:
 ```swift
 .target(
     name: "MyTarget",
-    dependencies: ["LibDave"]
+    dependencies: [
+        .product(name: "LibDave", package: "libdave-swift")
+    ]
 )
 ```
 
