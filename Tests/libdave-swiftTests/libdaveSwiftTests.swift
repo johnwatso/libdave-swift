@@ -1,7 +1,7 @@
 import XCTest
 @testable import libdave_swift
 
-final class LibDaveTests: XCTestCase {
+final class libdaveSwiftTests: XCTestCase {
 
     func testSupportedProtocolVersion() {
         let version = DaveSession.maxSupportedProtocolVersion

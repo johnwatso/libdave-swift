@@ -26,7 +26,7 @@ let package = Package(
                 "CDave",
                 "DaveFramework"
             ],
-            path: "Sources/LibDave"
+            path: "Sources/libdave-swift"
         ),
         // Precompiled C++ framework containing libdave + mlspp + openssl
         .binaryTarget(
@@ -36,7 +36,8 @@ let package = Package(
         // Test target to verify all operations
         .testTarget(
             name: "libdave-swiftTests",
-            dependencies: ["libdave-swift"]
+            dependencies: ["libdave-swift"],
+            path: "Tests/libdave-swiftTests"
         )
     ],
     cxxLanguageStandard: .cxx17
