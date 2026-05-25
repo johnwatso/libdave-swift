@@ -31,12 +31,14 @@ dependencies: [
 ]
 ```
 
-Then add the product target `LibDave` as a dependency in your application:
+Then add the product target `libdave-swift` as a dependency in your application:
 
 ```swift
 .target(
     name: "MyTarget",
-    dependencies: ["LibDave"]
+    dependencies: [
+        .product(name: "libdave-swift", package: "libdave-swift")
+    ]
 )
 ```
 
@@ -108,7 +110,7 @@ do {
 The repository contains:
 1. **`Frameworks/Dave.xcframework`**: Merged static libraries for Apple platforms.
 2. **`CDave` Target**: Maps low-level C headers (`dave.h`) to a system module map.
-3. **`LibDave` Target**: The Swift API and closure bridging wrappers.
+3. **`LibDave` Target**: The Swift module containing the public API and closure bridging wrappers. The package product is `libdave-swift`.
 
 ---
 
