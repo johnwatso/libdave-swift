@@ -1,0 +1,4 @@
+module CDave [system] {
+    header "dave.h"
+    export *
+}
