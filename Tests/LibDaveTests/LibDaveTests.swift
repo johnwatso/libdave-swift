@@ -102,4 +102,18 @@ final class LibDaveTests: XCTestCase {
             XCTFail("Passthrough encryption/decryption failed: \(error.localizedDescription)")
         }
     }
+
+    func testLoggerRegistration() {
+        var logReceived = false
+        DaveLogger.setLogSink(minSeverity: .verbose) { severity, file, line, message in
+            logReceived = true
+            print("[\(severity)] [\(file):\(line)] \(message)")
+        }
+        
+        // Trigger a log by creating a session (session creation prints logs)
+        _ = try? DaveSession(authSessionId: "test-logger") { _, _ in }
+        
+        DaveLogger.removeLogSink()
+        XCTAssertTrue(logReceived, "The log sink should have received at least one C++ log message")
+    }
 }
