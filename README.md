@@ -50,7 +50,7 @@ Here is a basic example of how to initialize a session and process frames:
 
 ```swift
 import Foundation
-import LibDave
+import libdave_swift
 
 do {
     // 1. Initialize a secure DAVE Session
@@ -110,7 +110,7 @@ do {
 The repository contains:
 1. **`Frameworks/Dave.xcframework`**: Merged static libraries for Apple platforms.
 2. **`CDave` Target**: Maps low-level C headers (`dave.h`) to a system module map.
-3. **`LibDave` Target**: The Swift module containing the public API and closure bridging wrappers. The package product is `libdave-swift`.
+3. **`libdave-swift` Target**: The Swift module containing the public API and closure bridging wrappers. Import it in Swift as `libdave_swift`, because Swift module names cannot contain hyphens.
 
 ---
 

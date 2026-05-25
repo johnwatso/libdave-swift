@@ -10,7 +10,7 @@ let package = Package(
     products: [
         .library(
             name: "libdave-swift",
-            targets: ["LibDave"]
+            targets: ["libdave-swift"]
         ),
     ],
     targets: [
@@ -21,7 +21,7 @@ let package = Package(
         ),
         // Premium Swift wrapper API
         .target(
-            name: "LibDave",
+            name: "libdave-swift",
             dependencies: [
                 "CDave",
                 "DaveFramework"
@@ -35,8 +35,8 @@ let package = Package(
         ),
         // Test target to verify all operations
         .testTarget(
-            name: "LibDaveTests",
-            dependencies: ["LibDave"]
+            name: "libdave-swiftTests",
+            dependencies: ["libdave-swift"]
         )
     ],
     cxxLanguageStandard: .cxx17

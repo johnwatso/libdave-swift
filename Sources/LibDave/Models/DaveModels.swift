@@ -126,7 +126,7 @@ public enum DaveDecryptorResultCode: UInt32, Error, Sendable, CustomStringConver
     }
 }
 
-/// Errors thrown by the LibDave module.
+/// Errors thrown by the libdave-swift module.
 public enum DaveError: Error, LocalizedError, Sendable {
     case sessionCreationFailed
     case encryptorCreationFailed

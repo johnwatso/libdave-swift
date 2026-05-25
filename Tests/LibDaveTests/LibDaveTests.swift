@@ -1,5 +1,5 @@
 import XCTest
-@testable import LibDave
+@testable import libdave_swift
 
 final class LibDaveTests: XCTestCase {
 
