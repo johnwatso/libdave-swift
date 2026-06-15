@@ -1,4 +1,12 @@
+<p align="center">
+  <img src="assets/libdaveswift.png" alt="libdave-swift logo" width="160">
+</p>
+
 # libdave-swift
+
+[![Swift 5.9](https://img.shields.io/badge/Swift-5.9-orange.svg)](https://swift.org)
+[![Swift Package Manager](https://img.shields.io/badge/SPM-compatible-brightgreen.svg)](https://www.swift.org/package-manager/)
+[![Platforms](https://img.shields.io/badge/platforms-iOS%2013%2B%20%7C%20macOS%2010.15%2B-lightgrey.svg)](Package.swift)
 
 A Swift Package wrapping **Discord's Audio & Video End-to-End Encryption (DAVE) Protocol**. 
 
