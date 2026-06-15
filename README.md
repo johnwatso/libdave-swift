@@ -12,7 +12,7 @@
 
 A Swift Package wrapping **Discord's Audio & Video End-to-End Encryption (DAVE) Protocol**. 
 
-This package was developed to support **`swiftbot`** with native end-to-end encryption capabilities on Apple platforms.
+This package was developed to support **[`swiftbot`](https://github.com/johnwatso/SwiftBot)** with native end-to-end encryption capabilities on Apple platforms.
 
 ---
 
