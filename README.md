@@ -26,6 +26,8 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 
 * **Self-Contained Integration:** All C++ core logic, Cisco's MLS library (`mlspp`), and OpenSSL 3.0 are statically precompiled into a unified `Dave.xcframework`. No external build tools (like CMake or vcpkg) are required by client applications.
 * **Type-Safe Swift Interfaces:** Raw C pointers and manual allocations are mapped behind standard Swift classes (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`).
+* **High-Level Coordinator:** `DaveSessionCoordinator` is an `actor` that orchestrates the session, key ratchets, and encryptor behind one async API, exposing handshake state and `DaveDiagnostics`.
+* **Contained Concurrency:** The coordinator runs on its own dedicated serial executor, so the synchronous, blocking native MLS calls underneath can never starve the host's shared cooperative thread pool — a stalled native call stays contained to that one thread.
 * **Lifecycle Management:** C++ session handles are managed automatically, freeing resources in `deinit` to prevent memory leaks.
 * **Callback Routing:** C-style function pointer callbacks are bridged to standard Swift closures.
 
@@ -33,11 +35,13 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 
 ## Installation
 
-Add the dependency to your project in Xcode, or append it to your `Package.swift` manifest:
+**Requirements:** macOS 26+ (the bundled `Dave.xcframework` is built with a macOS 26 deployment target).
+
+Add the dependency to your project in Xcode, or append it to your `Package.swift` manifest. Pinning to a tagged release is recommended:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/johnwatso/libdave-swift.git", branch: "main")
+    .package(url: "https://github.com/johnwatso/libdave-swift.git", from: "1.1.0")
 ]
 ```
 
@@ -56,7 +60,7 @@ Then add the product target `libdave-swift` as a dependency in your application:
 
 ## Quick Start Guide
 
-Here is a basic example of how to initialize a session and process frames:
+The example below uses the low-level wrappers to show the raw session/encrypt/decrypt flow. For application integration, prefer the high-level `DaveSessionCoordinator`, which manages session lifecycle, ratchet transitions, and diagnostics behind one async API.
 
 ```swift
 import Foundation
@@ -120,7 +124,7 @@ do {
 The repository contains:
 1. **`Frameworks/Dave.xcframework`**: Merged static libraries for macOS (arm64).
 2. **`CDave` Target**: Maps low-level C headers (`dave.h`) to a system module map.
-3. **`libdave-swift` Target**: The Swift module containing the public API and closure bridging wrappers. Import it in Swift as `libdave_swift`, because Swift module names cannot contain hyphens.
+3. **`libdave-swift` Target**: The Swift module containing the public API and closure bridging wrappers. Import it in Swift as `libdave_swift`, because Swift module names cannot contain hyphens. It layers a high-level `DaveSessionCoordinator` (`Coordination/`) over the low-level `DaveSession`/`DaveEncryptor`/`DaveDecryptor` wrappers (`Core/`); most integrations should prefer the coordinator.
 
 ---
 
