@@ -146,6 +146,14 @@ public final class DaveSession: @unchecked Sendable {
         daveSessionReset(handle)
     }
 
+    /// Returns and clears the most recent native MLS failure (source, reason),
+    /// if one was reported since the last call. Useful for attaching the real
+    /// native reason to an error thrown right after a transition call.
+    public func takeLastMLSFailure() -> (source: String, reason: String)? {
+        let bridge = Unmanaged<DaveSessionCallbackBridge>.fromOpaque(bridgePointer).takeUnretainedValue()
+        return bridge.takeLastFailure()
+    }
+
     /// Sets the protocol version for the session.
     public func setProtocolVersion(version: UInt16) {
         daveSessionSetProtocolVersion(handle, version)
@@ -264,19 +272,26 @@ public final class DaveSession: @unchecked Sendable {
     }
 
     /// Computes a pairwise fingerprint for identity verification with another user.
+    ///
+    /// The callback receives `nil` if the native library produced no fingerprint,
+    /// so an awaiting caller can always resume rather than hang indefinitely.
     public func getPairwiseFingerprint(
         version: UInt16,
         userId: String,
-        callback: @escaping @Sendable (Data) -> Void
+        callback: @escaping @Sendable (Data?) -> Void
     ) {
-        let bridge = Unmanaged<DaveSessionCallbackBridge>.fromOpaque(bridgePointer).takeUnretainedValue()
-        bridge.onPairwiseFingerprint = callback
-        daveSessionGetPairwiseFingerprint(
-            handle,
-            version,
-            userId.cString(using: .utf8),
-            davePairwiseFingerprintCallbackBridge,
-            bridgePointer
-        )
+        // Dedicated per-call bridge: concurrent requests cannot clobber one
+        // another's closure. The router consumes it via takeRetainedValue.
+        let bridge = DaveFingerprintCallbackBridge(callback: callback)
+        let bridgePtr = Unmanaged.passRetained(bridge).toOpaque()
+        userId.withCString { userIdPtr in
+            daveSessionGetPairwiseFingerprint(
+                handle,
+                version,
+                userIdPtr,
+                davePairwiseFingerprintCallbackBridge,
+                bridgePtr
+            )
+        }
     }
 }

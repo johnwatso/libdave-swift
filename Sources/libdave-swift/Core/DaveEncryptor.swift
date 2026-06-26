@@ -89,7 +89,10 @@ public final class DaveEncryptor: @unchecked Sendable {
             throw DaveError.encryptionFailed(reason: DaveEncryptorResultCode(result))
         }
 
-        return encryptedData.prefix(bytesWritten)
+        // Return a right-sized, zero-based copy. `prefix` would hand back a
+        // slice that retains the full max-capacity allocation and carries a
+        // non-zero startIndex (so caller `result[0]` would trap).
+        return Data(encryptedData.prefix(bytesWritten))
     }
 
     /// Sets a callback to be notified when the protocol version changes.

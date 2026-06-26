@@ -7,12 +7,12 @@
 <p align="center">
   <a href="https://swift.org"><img src="https://img.shields.io/badge/Swift-5.9-orange.svg" alt="Swift 5.9"></a>
   <a href="https://www.swift.org/package-manager/"><img src="https://img.shields.io/badge/SPM-compatible-brightgreen.svg" alt="Swift Package Manager compatible"></a>
-  <a href="Package.swift"><img src="https://img.shields.io/badge/platforms-iOS%2013%2B%20%7C%20macOS%2010.15%2B-lightgrey.svg" alt="Platforms: iOS 13+ and macOS 10.15+"></a>
+  <a href="Package.swift"><img src="https://img.shields.io/badge/platform-macOS%2026%2B-lightgrey.svg" alt="Platform: macOS 26+"></a>
 </p>
 
 A Swift Package wrapping **Discord's Audio & Video End-to-End Encryption (DAVE) Protocol**. 
 
-This package was developed to support **[`swiftbot`](https://github.com/johnwatso/SwiftBot)** with native end-to-end encryption capabilities on Apple platforms.
+This package was developed to support **[`swiftbot`](https://github.com/johnwatso/SwiftBot)** with native end-to-end encryption capabilities on macOS.
 
 ---
 
@@ -118,7 +118,7 @@ do {
 ## Architecture
 
 The repository contains:
-1. **`Frameworks/Dave.xcframework`**: Merged static libraries for Apple platforms.
+1. **`Frameworks/Dave.xcframework`**: Merged static libraries for macOS (arm64).
 2. **`CDave` Target**: Maps low-level C headers (`dave.h`) to a system module map.
 3. **`libdave-swift` Target**: The Swift module containing the public API and closure bridging wrappers. Import it in Swift as `libdave_swift`, because Swift module names cannot contain hyphens.
 

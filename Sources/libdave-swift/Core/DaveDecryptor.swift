@@ -62,7 +62,8 @@ public final class DaveDecryptor: @unchecked Sendable {
             throw DaveError.decryptionFailed(reason: DaveDecryptorResultCode(result))
         }
 
-        return plaintextData.prefix(bytesWritten)
+        // Return a right-sized, zero-based copy (see note in DaveEncryptor).
+        return Data(plaintextData.prefix(bytesWritten))
     }
 
     /// Gets decryption statistics for a given media type.

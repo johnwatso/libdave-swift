@@ -3,6 +3,20 @@ import CDave
 
 /// High-level actor orchestrating the DAVE/MLS session, key ratchets, and media encryption.
 public actor DaveSessionCoordinator {
+    /// Dedicated serial executor backing this actor.
+    ///
+    /// The DAVE/MLS calls underneath are synchronous, blocking C++/OpenSSL
+    /// operations. Running them on Swift's shared cooperative thread pool means
+    /// a single slow or wedged native call can starve unrelated async work in
+    /// the host process. By pinning the actor to its own serial queue, any such
+    /// stall is contained to this one thread — the rest of the host keeps
+    /// running — while still serializing access to the (non-thread-safe) native
+    /// session state.
+    private let executorQueue = DispatchSerialQueue(label: "com.libdave.session.coordinator")
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executorQueue.asUnownedSerialExecutor()
+    }
+
     // Lifecycles owned by actor
     private var session: DaveSession?
     private var encryptor: DaveEncryptor?
@@ -95,9 +109,13 @@ public actor DaveSessionCoordinator {
 
         switch transition {
         case .welcome(let welcomeData, let recognizedUserIds):
+            guard !welcomeData.isEmpty else {
+                handshakeState = .failed
+                throw DaveError.invalidTransition(message: "Welcome payload was empty")
+            }
             guard session.processWelcome(welcomeData, recognizedUserIds: recognizedUserIds) != nil else {
                 handshakeState = .failed
-                throw DaveError.handshakeFailed(reason: "Welcome processing returned nil")
+                throw DaveError.handshakeFailed(reason: "Welcome processing failed\(nativeFailureSuffix(session))")
             }
 
             // Manage ratchet transition for our user
@@ -115,10 +133,14 @@ public actor DaveSessionCoordinator {
             handshakeState = .ready
 
         case .commit(let commitData):
+            guard !commitData.isEmpty else {
+                handshakeState = .failed
+                throw DaveError.invalidTransition(message: "Commit payload was empty")
+            }
             let commitResult = session.processCommit(commitData)
             if commitResult.isFailed {
                 handshakeState = .failed
-                throw DaveError.handshakeFailed(reason: "Commit processing failed")
+                throw DaveError.handshakeFailed(reason: "Commit processing failed\(nativeFailureSuffix(session))")
             }
 
             if !commitResult.isIgnored {
@@ -187,8 +209,11 @@ public actor DaveSessionCoordinator {
         guard let session = session else {
             throw DaveError.notConfigured
         }
+        guard !proposals.isEmpty else {
+            throw DaveError.invalidTransition(message: "Proposals payload was empty")
+        }
         guard let result = session.processProposals(proposals, recognizedUserIds: recognizedUserIds) else {
-            throw DaveError.invalidState(message: "Proposals processing returned nil")
+            throw DaveError.invalidState(message: "Proposals processing failed\(nativeFailureSuffix(session))")
         }
         lastTransitionTimestamp = Date()
         return result
@@ -238,6 +263,15 @@ public actor DaveSessionCoordinator {
     private func handleMLSFailure(source: String, reason: String) {
         lastMlsError = "Source: \(source), Reason: \(reason)"
         handshakeState = .failed
+    }
+
+    /// Drains the most recent native MLS failure (reported via the failure
+    /// callback during the preceding native call) for inclusion in a thrown
+    /// error, and records it for diagnostics. Returns "" when none was reported.
+    private func nativeFailureSuffix(_ session: DaveSession) -> String {
+        guard let failure = session.takeLastMLSFailure() else { return "" }
+        lastMlsError = "Source: \(failure.source), Reason: \(failure.reason)"
+        return " — \(failure.source): \(failure.reason)"
     }
 
     private func handleProtocolVersionChanged() {

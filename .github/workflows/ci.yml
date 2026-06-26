@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    # Dave.xcframework is built with a macOS 26 deployment target, so the
+    # runner must be macOS 26+. Adjust this label if/when GitHub's runner
+    # image names change.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      # Build from a clean checkout (no cached .build) so the C++ stdlib
+      # linkage and binary deployment target are exercised the same way a
+      # fresh consumer would hit them.
+      - name: Build
+        run: swift build -v
+
+      - name: Test
+        run: swift test -v

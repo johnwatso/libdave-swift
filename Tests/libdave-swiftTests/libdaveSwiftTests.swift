@@ -224,4 +224,41 @@ final class libdaveSwiftTests: XCTestCase {
             XCTFail("Expected DaveError, got: \(error)")
         }
     }
+
+    func testCoordinatorRejectsEmptyTransitions() async throws {
+        let coordinator = DaveSessionCoordinator(authSessionId: "empty-test")
+        try await coordinator.configureForDiscordVoice(groupId: 2222, selfUserId: "user-222", protocolVersion: 1)
+
+        func assertInvalidTransition(
+            _ block: () async throws -> Void,
+            _ label: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            do {
+                try await block()
+                XCTFail("Should have thrown .invalidTransition for \(label)", file: file, line: line)
+            } catch let error as DaveError {
+                guard case .invalidTransition = error else {
+                    return XCTFail("Expected .invalidTransition for \(label), got: \(error)", file: file, line: line)
+                }
+            } catch {
+                XCTFail("Expected DaveError for \(label), got: \(error)", file: file, line: line)
+            }
+        }
+
+        // Empty payloads are rejected before crossing into native code, so a
+        // malformed/empty announcement can never wedge a native call.
+        await assertInvalidTransition({
+            try await coordinator.processDiscordTransition(.commit(Data()))
+        }, "empty commit")
+
+        await assertInvalidTransition({
+            try await coordinator.processDiscordTransition(.welcome(Data(), recognizedUserIds: ["user-222"]))
+        }, "empty welcome")
+
+        await assertInvalidTransition({
+            _ = try await coordinator.processProposals(Data(), recognizedUserIds: ["user-222"])
+        }, "empty proposals")
+    }
 }

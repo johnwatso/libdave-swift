@@ -4,8 +4,11 @@ import PackageDescription
 let package = Package(
     name: "libdave-swift",
     platforms: [
-        .macOS(.v10_15),
-        .iOS(.v13)
+        // The bundled Dave.xcframework is built with a macOS 26 deployment
+        // target, so the package minimum is aligned to match. Declaring a lower
+        // floor would surface as a cryptic link failure instead of a clear
+        // "requires macOS 26" diagnostic.
+        .macOS("26.0")
     ],
     products: [
         .library(
@@ -26,7 +29,17 @@ let package = Package(
                 "CDave",
                 "DaveFramework"
             ],
-            path: "Sources/libdave-swift"
+            path: "Sources/libdave-swift",
+            linkerSettings: [
+                // Dave.xcframework is a C-API shim over a C++ implementation
+                // (libdave + mlspp). Consumers must link the C++ standard
+                // library or the final link fails with unresolved libc++
+                // symbols (e.g. ___gxx_personality_v0, ___dynamic_cast).
+                // Declaring it here propagates the flag to anything that links
+                // this target, so a clean checkout builds without relying on
+                // pre-existing build artifacts.
+                .linkedLibrary("c++")
+            ]
         ),
         // Precompiled C++ framework containing libdave + mlspp + openssl
         .binaryTarget(
