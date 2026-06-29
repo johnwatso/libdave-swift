@@ -26,3 +26,37 @@ jobs:
 
       - name: Test
         run: swift test -v
+
+      - name: Consumer package smoke test
+        run: |
+          tmpdir="$(mktemp -d)"
+          cd "$tmpdir"
+          cat > Package.swift <<SWIFT
+          // swift-tools-version: 5.9
+          import PackageDescription
+
+          let package = Package(
+              name: "ConsumerSmoke",
+              platforms: [.macOS("26.0")],
+              dependencies: [
+                  .package(path: "$GITHUB_WORKSPACE")
+              ],
+              targets: [
+                  .executableTarget(
+                      name: "ConsumerSmoke",
+                      dependencies: [
+                          .product(name: "libdave-swift", package: "libdave-swift")
+                      ]
+                  )
+              ]
+          )
+          SWIFT
+
+          mkdir -p Sources/ConsumerSmoke
+          cat > Sources/ConsumerSmoke/main.swift <<'SWIFT'
+          import libdave_swift
+
+          print("libdave-swift max DAVE protocol: \(DaveSession.maxSupportedProtocolVersion)")
+          SWIFT
+
+          swift build -v

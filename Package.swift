@@ -50,7 +50,10 @@ let package = Package(
         .testTarget(
             name: "libdave-swiftTests",
             dependencies: ["libdave-swift"],
-            path: "Tests/libdave-swiftTests"
+            path: "Tests/libdave-swiftTests",
+            resources: [
+                .copy("Fixtures")
+            ]
         )
     ],
     cxxLanguageStandard: .cxx17

@@ -33,6 +33,16 @@ public actor DaveSessionCoordinator {
     private var lastMlsError: String?
     private var lastTransitionTimestamp: Date?
     private var isExternalSenderRegistered: Bool = false
+    private var externalSenderState: DaveExternalSenderState = .missing
+    private var externalSenderData: Data?
+    private var mediaReady: Bool = false
+    private var pendingEpoch: UInt64?
+    private var pendingTransitionId: UInt64?
+    private var lastRecoveryAction: DaveRecoveryAction?
+    private var hasSentInitialKeyPackage: Bool = false
+    private var mediaReadinessWatchdogStartedAt: Date?
+    private var mediaReadinessWatchdogTimeout: TimeInterval = 10
+    private var mediaReadinessWatchdogReason: String?
 
     /// Creates a new coordinator.
     /// - Parameter authSessionId: Optional identifier for managing persistent key lifetimes.
@@ -53,6 +63,23 @@ public actor DaveSessionCoordinator {
         try recreateSessionState()
     }
 
+    /// Configures a Discord Voice DAVE session and returns the first high-level
+    /// state snapshot for callers that want to drive the gateway with emitted
+    /// actions instead of assembling each step manually.
+    @discardableResult
+    public func configureDiscordVoiceSession(
+        groupId: UInt64,
+        selfUserId: String,
+        protocolVersion: UInt16
+    ) throws -> DiscordDaveTransitionResult {
+        try configureForDiscordVoice(
+            groupId: groupId,
+            selfUserId: selfUserId,
+            protocolVersion: protocolVersion
+        )
+        return makeDiscordResult(recoveryHint: .waitForExternalSender)
+    }
+
     /// Resets the MLS session state using the native library's reset capabilities.
     public func reset() {
         session?.reset()
@@ -63,6 +90,14 @@ public actor DaveSessionCoordinator {
         lastMlsError = nil
         lastTransitionTimestamp = Date()
         isExternalSenderRegistered = false
+        externalSenderState = .missing
+        externalSenderData = nil
+        mediaReady = false
+        pendingEpoch = nil
+        pendingTransitionId = nil
+        lastRecoveryAction = .reset
+        hasSentInitialKeyPackage = false
+        clearMediaReadinessWatchdog()
     }
 
     /// Recreates the MLS session state and reinitializes with current settings.
@@ -72,11 +107,13 @@ public actor DaveSessionCoordinator {
         if let groupId = groupId, let selfUserId = selfUserId {
             try initializeSession(groupId: groupId, selfUserId: selfUserId)
         }
+        lastRecoveryAction = .recreateSession
     }
 
     /// Rebuilds only the encryptor, preserving session state but invalidating existing ratchets.
     public func rebuildEncryptor() throws {
         encryptor = try DaveEncryptor()
+        lastRecoveryAction = .rebuildEncryptor
 
         // Wire version changes to the actor safely
         encryptor?.setProtocolVersionChangedCallback { [weak self] in
@@ -131,6 +168,12 @@ public actor DaveSessionCoordinator {
 
             currentEpoch += 1
             handshakeState = .ready
+            mediaReady = true
+            pendingEpoch = nil
+            pendingTransitionId = nil
+            lastMlsError = nil
+            lastRecoveryAction = .processWelcome
+            clearMediaReadinessWatchdog()
 
         case .commit(let commitData):
             guard !commitData.isEmpty else {
@@ -158,7 +201,229 @@ public actor DaveSessionCoordinator {
                 currentEpoch += 1
             }
             handshakeState = .ready
+            mediaReady = true
+            pendingEpoch = nil
+            pendingTransitionId = nil
+            lastMlsError = nil
+            lastRecoveryAction = .processCommit
+            clearMediaReadinessWatchdog()
         }
+    }
+
+    /// Registers Discord's MLS external sender and optionally emits the initial
+    /// key package action exactly once for this session generation.
+    @discardableResult
+    public func registerDiscordExternalSender(
+        _ externalSender: Data,
+        publishInitialKeyPackage: Bool = true
+    ) throws -> DiscordDaveTransitionResult {
+        try setExternalSender(externalSender)
+
+        var actions: [DiscordDaveOutboundAction] = []
+        if publishInitialKeyPackage,
+           let keyPackageAction = try makeInitialKeyPackageActionIfNeeded(requireExternalSender: true) {
+            actions.append(keyPackageAction)
+        }
+
+        return makeDiscordResult(actions: actions)
+    }
+
+    /// Emits the initial key package action exactly once for this session
+    /// generation. Prefer `registerDiscordExternalSender(_:publishInitialKeyPackage:)`;
+    /// this method exists for clients that intentionally use a delayed fallback.
+    @discardableResult
+    public func publishDiscordInitialKeyPackage() throws -> DiscordDaveTransitionResult {
+        var actions: [DiscordDaveOutboundAction] = []
+        if let keyPackageAction = try makeInitialKeyPackageActionIfNeeded(requireExternalSender: false) {
+            actions.append(keyPackageAction)
+        }
+        return makeDiscordResult(actions: actions)
+    }
+
+    /// Marks the current generation's initial key package as already published
+    /// for callers that still send `getMarshalledKeyPackage()` manually.
+    public func markInitialKeyPackageSent() {
+        hasSentInitialKeyPackage = true
+        lastRecoveryAction = .sendInitialKeyPackage
+        lastTransitionTimestamp = Date()
+    }
+
+    /// Processes Discord MLS proposals and returns the commit/welcome payload
+    /// action to send back through the voice gateway.
+    @discardableResult
+    public func processDiscordProposalsForOutbound(
+        _ proposals: Data,
+        recognizedUserIds: [String]
+    ) throws -> DiscordDaveTransitionResult {
+        let commitWelcome = try processProposals(proposals, recognizedUserIds: recognizedUserIds)
+        return makeDiscordResult(actions: [.mlsCommitWelcome(commitWelcome)])
+    }
+
+    /// Processes a Discord Welcome transition and returns either transition-ready
+    /// or a complete invalid-transition recovery action set.
+    @discardableResult
+    public func processDiscordWelcomeForOutbound(
+        _ welcome: Data,
+        transitionId: UInt64,
+        recognizedUserIds: [String],
+        recoveryTimeout: TimeInterval = 10
+    ) throws -> DiscordDaveTransitionResult {
+        do {
+            try processDiscordTransition(.welcome(welcome, recognizedUserIds: recognizedUserIds))
+            return makeDiscordResult(actions: [.transitionReady(transitionId)])
+        } catch let error as DaveError where error.recoveryHint == .sendInvalidCommitWelcome {
+            return try recoverDiscordInvalidTransition(transitionId: transitionId, timeout: recoveryTimeout)
+        }
+    }
+
+    /// Processes a Discord Commit transition and returns either transition-ready
+    /// or a complete invalid-transition recovery action set.
+    @discardableResult
+    public func processDiscordCommitForOutbound(
+        _ commit: Data,
+        transitionId: UInt64,
+        recoveryTimeout: TimeInterval = 10
+    ) throws -> DiscordDaveTransitionResult {
+        do {
+            try processDiscordTransition(.commit(commit))
+            return makeDiscordResult(actions: [.transitionReady(transitionId)])
+        } catch let error as DaveError where error.recoveryHint == .sendInvalidCommitWelcome {
+            return try recoverDiscordInvalidTransition(transitionId: transitionId, timeout: recoveryTimeout)
+        }
+    }
+
+    /// Handles Discord's execute-transition signal. Media is marked ready only
+    /// once MLS processing has installed a ratchet and the coordinator is ready.
+    @discardableResult
+    public func executeDiscordTransition(_ transitionId: UInt64) -> DiscordDaveTransitionResult {
+        guard handshakeState == .ready else {
+            mediaReady = false
+            pendingTransitionId = transitionId
+            lastTransitionTimestamp = Date()
+            return makeDiscordResult(recoveryHint: .retryLater)
+        }
+
+        _ = markDiscordMediaReady(reason: "execute transition \(transitionId)")
+        return makeDiscordResult()
+    }
+
+    /// Prepares a fresh Discord DAVE epoch, preserving a cached external sender
+    /// when available and emitting a new key package action for the recreated
+    /// MLS session.
+    @discardableResult
+    public func prepareDiscordEpoch(
+        protocolVersion: UInt16,
+        epoch: UInt64,
+        timeout: TimeInterval = 10
+    ) throws -> DiscordDaveTransitionResult {
+        guard groupId != nil, selfUserId != nil else {
+            throw DaveError.notConfigured
+        }
+
+        let cachedExternalSender = externalSenderData
+        self.protocolVersion = protocolVersion
+        try recreateSessionState()
+
+        var actions: [DiscordDaveOutboundAction] = []
+        if let cachedExternalSender {
+            try setExternalSender(cachedExternalSender)
+            appendInitialKeyPackageActionIfAvailable(to: &actions, requireExternalSender: true)
+        }
+
+        _ = markDiscordMediaNotReady(
+            reason: "prepare epoch \(epoch)",
+            pendingEpoch: epoch,
+            timeout: timeout
+        )
+
+        return makeDiscordResult(
+            actions: actions,
+            recoveryHint: cachedExternalSender == nil ? .waitForExternalSender : .none
+        )
+    }
+
+    /// Recovers from an invalid commit/welcome by recreating local MLS state,
+    /// preserving a cached external sender, and emitting the Discord recovery
+    /// actions in send order.
+    @discardableResult
+    public func recoverDiscordInvalidTransition(
+        transitionId: UInt64,
+        timeout: TimeInterval = 10
+    ) throws -> DiscordDaveTransitionResult {
+        let cachedExternalSender = externalSenderData
+        try recreateSessionState()
+
+        var actions: [DiscordDaveOutboundAction] = [.invalidCommitWelcome(transitionId)]
+        if let cachedExternalSender {
+            try setExternalSender(cachedExternalSender)
+            appendInitialKeyPackageActionIfAvailable(to: &actions, requireExternalSender: true)
+        }
+
+        _ = markDiscordMediaNotReady(
+            reason: "invalid transition \(transitionId) recovery",
+            pendingTransitionId: transitionId,
+            timeout: timeout
+        )
+        lastRecoveryAction = .invalidTransitionRecovery
+
+        return makeDiscordResult(
+            actions: actions,
+            recoveryHint: cachedExternalSender == nil ? .waitForExternalSender : .recreateSession
+        )
+    }
+
+    /// Marks DAVE media as unavailable while a new Discord MLS transition is in
+    /// flight and starts the coordinator-owned readiness watchdog.
+    @discardableResult
+    public func markDiscordMediaNotReady(
+        reason: String,
+        pendingTransitionId: UInt64? = nil,
+        pendingEpoch: UInt64? = nil,
+        timeout: TimeInterval = 10
+    ) -> DaveMediaReadinessWatchdogStatus {
+        mediaReady = false
+        if let pendingTransitionId {
+            self.pendingTransitionId = pendingTransitionId
+        }
+        if let pendingEpoch {
+            self.pendingEpoch = pendingEpoch
+        }
+        mediaReadinessWatchdogStartedAt = Date()
+        mediaReadinessWatchdogTimeout = max(0, timeout)
+        mediaReadinessWatchdogReason = reason
+        lastRecoveryAction = .pauseMedia
+        lastTransitionTimestamp = Date()
+        return evaluateMediaReadinessWatchdog()
+    }
+
+    /// Marks DAVE media as ready and clears any pending readiness watchdog.
+    @discardableResult
+    public func markDiscordMediaReady(reason: String? = nil) -> DaveMediaReadinessWatchdogStatus {
+        mediaReady = true
+        pendingEpoch = nil
+        pendingTransitionId = nil
+        lastRecoveryAction = .resumeMedia
+        lastTransitionTimestamp = Date()
+        clearMediaReadinessWatchdog()
+        return .inactive
+    }
+
+    /// Evaluates whether an in-flight DAVE media refresh has exceeded its
+    /// allowed readiness window.
+    public func evaluateMediaReadinessWatchdog(now: Date = Date()) -> DaveMediaReadinessWatchdogStatus {
+        guard !mediaReady, let startedAt = mediaReadinessWatchdogStartedAt else {
+            return .inactive
+        }
+
+        let remaining = mediaReadinessWatchdogTimeout - now.timeIntervalSince(startedAt)
+        guard remaining <= 0 else {
+            return .pending(secondsRemaining: remaining)
+        }
+
+        return .timedOut(
+            reason: mediaReadinessWatchdogReason ?? "DAVE media readiness",
+            recoveryHint: .recreateSession
+        )
     }
 
     /// Encrypts an audio frame specifically for Discord Voice.
@@ -190,6 +455,9 @@ public actor DaveSessionCoordinator {
         }
         session.setExternalSender(externalSender)
         isExternalSenderRegistered = true
+        externalSenderState = .registered
+        externalSenderData = externalSender
+        lastRecoveryAction = .registerExternalSender
         lastTransitionTimestamp = Date()
     }
 
@@ -215,6 +483,7 @@ public actor DaveSessionCoordinator {
         guard let result = session.processProposals(proposals, recognizedUserIds: recognizedUserIds) else {
             throw DaveError.invalidState(message: "Proposals processing failed\(nativeFailureSuffix(session))")
         }
+        lastRecoveryAction = .processProposals
         lastTransitionTimestamp = Date()
         return result
     }
@@ -237,7 +506,13 @@ public actor DaveSessionCoordinator {
             encryptionStats: stats,
             lastMlsError: lastMlsError,
             lastTransitionTimestamp: lastTransitionTimestamp,
-            isExternalSenderRegistered: isExternalSenderRegistered
+            isExternalSenderRegistered: isExternalSenderRegistered,
+            mediaReady: mediaReady,
+            pendingEpoch: pendingEpoch,
+            pendingTransitionId: pendingTransitionId,
+            externalSenderState: externalSenderState,
+            lastRecoveryAction: lastRecoveryAction,
+            hasSentInitialKeyPackage: hasSentInitialKeyPackage
         )
     }
 
@@ -272,6 +547,52 @@ public actor DaveSessionCoordinator {
         guard let failure = session.takeLastMLSFailure() else { return "" }
         lastMlsError = "Source: \(failure.source), Reason: \(failure.reason)"
         return " — \(failure.source): \(failure.reason)"
+    }
+
+    private func makeInitialKeyPackageActionIfNeeded(requireExternalSender: Bool) throws -> DiscordDaveOutboundAction? {
+        guard !hasSentInitialKeyPackage else {
+            return nil
+        }
+        if requireExternalSender, externalSenderState != .registered {
+            return nil
+        }
+
+        let keyPackage = try getMarshalledKeyPackage()
+        hasSentInitialKeyPackage = true
+        lastRecoveryAction = .sendInitialKeyPackage
+        lastTransitionTimestamp = Date()
+        return .mlsKeyPackage(keyPackage)
+    }
+
+    private func appendInitialKeyPackageActionIfAvailable(
+        to actions: inout [DiscordDaveOutboundAction],
+        requireExternalSender: Bool
+    ) {
+        do {
+            if let keyPackageAction = try makeInitialKeyPackageActionIfNeeded(requireExternalSender: requireExternalSender) {
+                actions.append(keyPackageAction)
+            }
+        } catch {
+            lastMlsError = "Failed to generate initial key package: \(error.localizedDescription)"
+        }
+    }
+
+    private func makeDiscordResult(
+        actions: [DiscordDaveOutboundAction] = [],
+        recoveryHint: DaveRecoveryHint = .none
+    ) -> DiscordDaveTransitionResult {
+        DiscordDaveTransitionResult(
+            outboundActions: actions,
+            mediaReady: mediaReady,
+            recoveryHint: recoveryHint,
+            diagnostics: getDiagnostics()
+        )
+    }
+
+    private func clearMediaReadinessWatchdog() {
+        mediaReadinessWatchdogStartedAt = nil
+        mediaReadinessWatchdogTimeout = 10
+        mediaReadinessWatchdogReason = nil
     }
 
     private func handleProtocolVersionChanged() {

@@ -126,6 +126,95 @@ public enum DaveDecryptorResultCode: UInt32, Error, Sendable, CustomStringConver
     }
 }
 
+/// Recovery guidance callers can use without parsing human-readable error text.
+public enum DaveRecoveryHint: String, Codable, Sendable, CustomStringConvertible {
+    /// No special recovery action is suggested.
+    case none
+    /// The operation raced a state transition; retry after the next DAVE event.
+    case retryLater
+    /// Wait for Discord's MLS external sender package before publishing a key package.
+    case waitForExternalSender
+    /// Notify Discord that the commit/welcome was invalid for the current session.
+    case sendInvalidCommitWelcome
+    /// Recreate the MLS session and publish a fresh key package.
+    case recreateSession
+    /// The caller should treat this as unrecoverable for the current voice session.
+    case fatal
+
+    public var description: String {
+        rawValue
+    }
+}
+
+/// Coarse lifecycle state for Discord's MLS external sender package.
+public enum DaveExternalSenderState: String, Codable, Sendable {
+    case missing
+    case registered
+}
+
+/// Last meaningful recovery or state-machine action performed by the coordinator.
+public enum DaveRecoveryAction: String, Codable, Sendable {
+    case reset
+    case recreateSession
+    case rebuildEncryptor
+    case registerExternalSender
+    case sendInitialKeyPackage
+    case processProposals
+    case processWelcome
+    case processCommit
+    case pauseMedia
+    case resumeMedia
+    case invalidTransitionRecovery
+}
+
+/// Outbound Discord DAVE action emitted by the high-level coordinator helpers.
+public enum DiscordDaveOutboundAction: Sendable, Equatable {
+    /// Send as binary opcode 26 (`daveMlsKeyPackage`).
+    case mlsKeyPackage(Data)
+    /// Send as binary opcode 28 (`daveMlsCommitWelcome`).
+    case mlsCommitWelcome(Data)
+    /// Send as voice gateway opcode 23 (`daveTransitionReady`).
+    case transitionReady(UInt64)
+    /// Send as voice gateway opcode 31 (`daveMlsInvalidCommitWelcome`).
+    case invalidCommitWelcome(UInt64)
+}
+
+/// Result from a high-level Discord DAVE state-machine step.
+public struct DiscordDaveTransitionResult: Sendable {
+    public let outboundActions: [DiscordDaveOutboundAction]
+    public let mediaReady: Bool
+    public let recoveryHint: DaveRecoveryHint
+    public let diagnostics: DaveDiagnostics
+
+    public init(
+        outboundActions: [DiscordDaveOutboundAction],
+        mediaReady: Bool,
+        recoveryHint: DaveRecoveryHint,
+        diagnostics: DaveDiagnostics
+    ) {
+        self.outboundActions = outboundActions
+        self.mediaReady = mediaReady
+        self.recoveryHint = recoveryHint
+        self.diagnostics = diagnostics
+    }
+
+    public var needsRecovery: Bool {
+        switch recoveryHint {
+        case .none, .retryLater, .waitForExternalSender:
+            return false
+        case .sendInvalidCommitWelcome, .recreateSession, .fatal:
+            return true
+        }
+    }
+}
+
+/// Status for the coordinator-owned DAVE media-readiness watchdog.
+public enum DaveMediaReadinessWatchdogStatus: Sendable, Equatable {
+    case inactive
+    case pending(secondsRemaining: TimeInterval)
+    case timedOut(reason: String, recoveryHint: DaveRecoveryHint)
+}
+
 /// Errors thrown by the libdave-swift module.
 public enum DaveError: Error, LocalizedError, Sendable {
     case sessionCreationFailed
@@ -167,6 +256,43 @@ public enum DaveError: Error, LocalizedError, Sendable {
             return "Invalid session state: \(message)"
         case .notConfigured:
             return "DAVE Session Coordinator is not configured. Please call configureForDiscordVoice first."
+        }
+    }
+
+    /// Machine-readable recovery guidance for callers that want to automate
+    /// Discord voice-session recovery without parsing `localizedDescription`.
+    public var recoveryHint: DaveRecoveryHint {
+        switch self {
+        case .sessionCreationFailed, .encryptorCreationFailed, .decryptorCreationFailed:
+            return .fatal
+        case .handshakeFailed:
+            return .sendInvalidCommitWelcome
+        case .protocolMismatch:
+            return .recreateSession
+        case .invalidTransition:
+            return .sendInvalidCommitWelcome
+        case .ratchetFailed:
+            return .recreateSession
+        case .encryptionFailed(let reason):
+            switch reason {
+            case .missingKeyRatchet, .missingCryptor:
+                return .retryLater
+            case .tooManyAttempts, .encryptionFailure, .success:
+                return .recreateSession
+            }
+        case .decryptionFailed(let reason):
+            switch reason {
+            case .missingKeyRatchet, .missingCryptor:
+                return .retryLater
+            case .invalidNonce, .decryptionFailure, .success:
+                return .recreateSession
+            }
+        case .bufferTooSmall:
+            return .fatal
+        case .invalidState:
+            return .retryLater
+        case .notConfigured:
+            return .fatal
         }
     }
 }

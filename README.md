@@ -27,6 +27,8 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 * **Self-Contained Integration:** All C++ core logic, Cisco's MLS library (`mlspp`), and OpenSSL 3.0 are statically precompiled into a unified `Dave.xcframework`. No external build tools (like CMake or vcpkg) are required by client applications.
 * **Type-Safe Swift Interfaces:** Raw C pointers and manual allocations are mapped behind standard Swift classes (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`).
 * **High-Level Coordinator:** `DaveSessionCoordinator` is an `actor` that orchestrates the session, key ratchets, and encryptor behind one async API, exposing handshake state and `DaveDiagnostics`.
+* **Discord Action Flow:** Coordinator helpers emit typed outbound actions for Discord Voice gateway messages such as MLS key packages, commit/welcome payloads, transition-ready, and invalid commit/welcome recovery.
+* **Recovery Diagnostics:** Typed recovery hints, external sender state, pending epoch/transition tracking, and a media-readiness watchdog make stalled DAVE transitions visible without parsing logs.
 * **Contained Concurrency:** The coordinator runs on its own dedicated serial executor, so the synchronous, blocking native MLS calls underneath can never starve the host's shared cooperative thread pool — a stalled native call stays contained to that one thread.
 * **Lifecycle Management:** C++ session handles are managed automatically, freeing resources in `deinit` to prevent memory leaks.
 * **Callback Routing:** C-style function pointer callbacks are bridged to standard Swift closures.
@@ -41,7 +43,7 @@ Add the dependency to your project in Xcode, or append it to your `Package.swift
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/johnwatso/libdave-swift.git", from: "1.1.0")
+    .package(url: "https://github.com/johnwatso/libdave-swift.git", from: "1.2.0")
 ]
 ```
 
@@ -116,6 +118,51 @@ do {
     print("DAVE Protocol Error: \(error.localizedDescription)")
 }
 ```
+
+---
+
+## Discord Voice Coordinator Flow
+
+Most Discord clients should use `DaveSessionCoordinator` and send the emitted `DiscordDaveOutboundAction` values through their voice gateway layer. The coordinator keeps track of one-time key-package publishing, cached external sender state, pending media readiness, and invalid-transition recovery.
+
+```swift
+let coordinator = DaveSessionCoordinator()
+
+try await coordinator.configureDiscordVoiceSession(
+    groupId: guildId,
+    selfUserId: userId,
+    protocolVersion: daveVersion
+)
+
+let registered = try await coordinator.registerDiscordExternalSender(externalSender)
+for action in registered.outboundActions {
+    switch action {
+    case .mlsKeyPackage(let data):
+        try await gateway.sendMlsKeyPackage(data)
+    case .mlsCommitWelcome(let data):
+        try await gateway.sendMlsCommitWelcome(data)
+    case .transitionReady(let transitionId):
+        try await gateway.sendTransitionReady(transitionId: transitionId)
+    case .invalidCommitWelcome(let transitionId):
+        try await gateway.sendInvalidCommitWelcome(transitionId: transitionId)
+    }
+}
+```
+
+When Discord announces a commit or welcome, the high-level helpers return either `.transitionReady(...)` or the ordered recovery actions needed after an invalid commit/welcome:
+
+```swift
+let result = try await coordinator.processDiscordCommitForOutbound(
+    commitBytes,
+    transitionId: transitionId
+)
+
+if result.needsRecovery {
+    print("DAVE recovery hint: \(result.recoveryHint)")
+}
+```
+
+For established sessions, call `prepareDiscordEpoch(protocolVersion:epoch:)` when Discord prepares a fresh epoch and `executeDiscordTransition(_:)` when Discord later confirms execution. The coordinator-owned media readiness watchdog can be queried with `evaluateMediaReadinessWatchdog()` if the host wants to fail or reconnect a session that never becomes ready again.
 
 ---
 
