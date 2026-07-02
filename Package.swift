@@ -30,6 +30,12 @@ let package = Package(
                 "DaveFramework"
             ],
             path: "Sources/libdave-swift",
+            swiftSettings: [
+                // The wrapper types make explicit Sendable/isolation claims
+                // (actor coordinator, @unchecked Sendable handle wrappers).
+                // Strict checking keeps those claims honest at compile time.
+                .enableExperimentalFeature("StrictConcurrency")
+            ],
             linkerSettings: [
                 // Dave.xcframework is a C-API shim over a C++ implementation
                 // (libdave + mlspp). Consumers must link the C++ standard
@@ -53,6 +59,9 @@ let package = Package(
             path: "Tests/libdave-swiftTests",
             resources: [
                 .copy("Fixtures")
+            ],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
             ]
         )
     ],

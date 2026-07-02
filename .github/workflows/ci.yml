@@ -60,3 +60,6 @@ jobs:
           SWIFT
 
           swift build -v
+          # Running the binary (not just building it) catches runtime link
+          # failures against the bundled xcframework that a build alone misses.
+          swift run ConsumerSmoke

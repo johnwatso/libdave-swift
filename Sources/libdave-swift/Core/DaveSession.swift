@@ -2,6 +2,10 @@ import Foundation
 import CDave
 
 /// Opaque wrapper for a DAVE Key Ratchet.
+///
+/// `@unchecked Sendable` is justified because the wrapper is immutable after
+/// init and the native handle is only read by the encryptor/decryptor it is
+/// handed to; the wrapper itself performs no mutation outside `deinit`.
 public final class DaveKeyRatchet: @unchecked Sendable {
     internal let handle: DAVEKeyRatchetHandle
 
@@ -101,7 +105,14 @@ public final class DaveWelcomeResult: @unchecked Sendable {
 }
 
 /// A DAVE session handle managing group encryption state and MLS protocol integration.
-public final class DaveSession: @unchecked Sendable {
+///
+/// > Important: The underlying native MLS session is **not thread-safe**. All
+/// > calls on one `DaveSession` must be externally serialized — one thread,
+/// > one serial queue, or one actor. `DaveSessionCoordinator` provides this
+/// > serialization; use it unless you are building your own coordination layer.
+/// > This type is intentionally not `Sendable` so the compiler flags attempts
+/// > to share it across concurrency domains.
+public final class DaveSession {
     internal let handle: DAVESessionHandle
     private let bridgePointer: UnsafeMutableRawPointer
 
@@ -275,6 +286,12 @@ public final class DaveSession: @unchecked Sendable {
     ///
     /// The callback receives `nil` if the native library produced no fingerprint,
     /// so an awaiting caller can always resume rather than hang indefinitely.
+    ///
+    /// The native library invokes the callback exactly once, synchronously,
+    /// before `daveSessionGetPairwiseFingerprint` returns. The per-call bridge
+    /// is retained until that invocation, so a native implementation that never
+    /// called back would leak the closure — the current implementation always
+    /// calls back.
     public func getPairwiseFingerprint(
         version: UInt16,
         userId: String,
@@ -292,6 +309,18 @@ public final class DaveSession: @unchecked Sendable {
                 davePairwiseFingerprintCallbackBridge,
                 bridgePtr
             )
+        }
+    }
+
+    /// Async variant of ``getPairwiseFingerprint(version:userId:callback:)``.
+    ///
+    /// Returns `nil` when the native library produced no fingerprint (e.g. the
+    /// remote user is not in the current MLS group).
+    public func pairwiseFingerprint(version: UInt16, userId: String) async -> Data? {
+        await withCheckedContinuation { continuation in
+            getPairwiseFingerprint(version: version, userId: userId) { fingerprint in
+                continuation.resume(returning: fingerprint)
+            }
         }
     }
 }

@@ -26,10 +26,12 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 
 * **Self-Contained Integration:** All C++ core logic, Cisco's MLS library (`mlspp`), and OpenSSL 3.0 are statically precompiled into a unified `Dave.xcframework`. No external build tools (like CMake or vcpkg) are required by client applications.
 * **Type-Safe Swift Interfaces:** Raw C pointers and manual allocations are mapped behind standard Swift classes (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`).
-* **High-Level Coordinator:** `DaveSessionCoordinator` is an `actor` that orchestrates the session, key ratchets, and encryptor behind one async API, exposing handshake state and `DaveDiagnostics`.
+* **High-Level Coordinator:** `DaveSessionCoordinator` is an `actor` that orchestrates the session, key ratchets, and media crypto behind one async API, exposing handshake state and `DaveDiagnostics`.
+* **Full-Duplex Media:** The coordinator handles both directions — `encryptDiscordAudioFrame` for outbound audio and `decryptDiscordAudioFrame(_:from:)` for inbound, with one decryptor per remote speaker kept in step with the MLS roster after every welcome/commit.
 * **Discord Action Flow:** Coordinator helpers emit typed outbound actions for Discord Voice gateway messages such as MLS key packages, commit/welcome payloads, transition-ready, and invalid commit/welcome recovery.
 * **Recovery Diagnostics:** Typed recovery hints, external sender state, pending epoch/transition tracking, and a media-readiness watchdog make stalled DAVE transitions visible without parsing logs.
 * **Contained Concurrency:** The coordinator runs on its own dedicated serial executor, so the synchronous, blocking native MLS calls underneath can never starve the host's shared cooperative thread pool — a stalled native call stays contained to that one thread.
+* **Strict-Concurrency Clean:** The package builds warning-free with strict concurrency checking enabled. The low-level wrappers (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`) are intentionally **not `Sendable`** because the native state underneath is not thread-safe; serialize access through one actor or queue — the coordinator does this for you.
 * **Lifecycle Management:** C++ session handles are managed automatically, freeing resources in `deinit` to prevent memory leaks.
 * **Callback Routing:** C-style function pointer callbacks are bridged to standard Swift closures.
 
@@ -162,7 +164,21 @@ if result.needsRecovery {
 }
 ```
 
-For established sessions, call `prepareDiscordEpoch(protocolVersion:epoch:)` when Discord prepares a fresh epoch and `executeDiscordTransition(_:)` when Discord later confirms execution. The coordinator-owned media readiness watchdog can be queried with `evaluateMediaReadinessWatchdog()` if the host wants to fail or reconnect a session that never becomes ready again.
+Once media is ready, both directions of the voice path go through the coordinator:
+
+```swift
+// Outbound: encrypt your Opus frames before RTP packetization
+let ciphertext = try await coordinator.encryptDiscordAudioFrame(opusFrame, ssrc: audioSsrc)
+
+// Inbound: decrypt each remote speaker's frames by Discord user ID.
+// Decryptors are created lazily per speaker and re-keyed automatically
+// after every MLS welcome/commit.
+let plaintext = try await coordinator.decryptDiscordAudioFrame(payload, from: senderUserId)
+```
+
+If a frame races an MLS transition, `decryptDiscordAudioFrame` throws `DaveError.decryptionFailed(reason: .missingKeyRatchet)` whose `recoveryHint` is `.retryLater` — drop the frame and continue.
+
+For established sessions, call `prepareDiscordEpoch(protocolVersion:epoch:)` when Discord prepares a fresh epoch and `executeDiscordTransition(_:)` when Discord later confirms execution. The coordinator-owned media readiness watchdog can be queried with `evaluateMediaReadinessWatchdog()` if the host wants to fail or reconnect a session that never becomes ready again. Identity verification is available via `pairwiseFingerprint(version:userId:)`.
 
 ---
 

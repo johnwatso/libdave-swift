@@ -2,7 +2,13 @@ import Foundation
 import CDave
 
 /// An encryptor for media frames (audio/video) in a DAVE session.
-public final class DaveEncryptor: @unchecked Sendable {
+///
+/// > Important: The underlying native encryptor is **not thread-safe**. All
+/// > calls on one `DaveEncryptor` must be externally serialized (one thread,
+/// > queue, or actor — `DaveSessionCoordinator` provides this). This type is
+/// > intentionally not `Sendable` so the compiler flags attempts to share it
+/// > across concurrency domains.
+public final class DaveEncryptor {
     internal let handle: DAVEEncryptorHandle
     private var bridgePointer: UnsafeMutableRawPointer? = nil
     private let lock = NSLock()

@@ -12,7 +12,16 @@ public enum DaveHandshakeState: String, Codable, Sendable {
 /// Lightweight diagnostics exposing session state and encryption health.
 public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
     public let protocolVersion: UInt16
-    public let currentEpoch: UInt64
+    /// Number of MLS transitions (welcome/commit) this coordinator has applied
+    /// to the current session generation.
+    ///
+    /// The C API exposes no way to read the group's real MLS epoch, so this is
+    /// a locally tracked counter — it does *not* match the epoch other group
+    /// members see (e.g. joining an established group via welcome reports 1
+    /// here regardless of the group's actual epoch).
+    public let appliedTransitionCount: UInt64
+    @available(*, deprecated, renamed: "appliedTransitionCount", message: "This was never the real MLS epoch, only a locally applied transition counter.")
+    public var currentEpoch: UInt64 { appliedTransitionCount }
     public let handshakeState: DaveHandshakeState
     public let encryptionStats: DaveEncryptorStats?
     public let lastMlsError: String?
@@ -27,7 +36,7 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
 
     public init(
         protocolVersion: UInt16,
-        currentEpoch: UInt64,
+        appliedTransitionCount: UInt64,
         handshakeState: DaveHandshakeState,
         encryptionStats: DaveEncryptorStats?,
         lastMlsError: String?,
@@ -41,7 +50,7 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         hasSentInitialKeyPackage: Bool = false
     ) {
         self.protocolVersion = protocolVersion
-        self.currentEpoch = currentEpoch
+        self.appliedTransitionCount = appliedTransitionCount
         self.handshakeState = handshakeState
         self.encryptionStats = encryptionStats
         self.lastMlsError = lastMlsError
@@ -64,7 +73,7 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         return """
         DaveDiagnostics:
           Protocol Version: \(protocolVersion)
-          Current Epoch: \(currentEpoch)
+          Applied Transitions: \(appliedTransitionCount)
           Handshake State: \(handshakeState.rawValue)
           Media Ready: \(mediaReady)
           External Sender Registered: \(isExternalSenderRegistered)

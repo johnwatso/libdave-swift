@@ -12,22 +12,33 @@ internal final class DaveLogCallbackBridge: @unchecked Sendable {
     }
 }
 
-/// Global logging manager for the DAVE library.
-public final class DaveLogger: @unchecked Sendable {
-    private static let lock = NSLock()
-    private static var _activeBridge: DaveLogCallbackBridge? = nil
+/// Lock-guarded holder for the active log bridge, so the global mutable state
+/// lives behind a `static let` that strict concurrency checking accepts.
+internal final class DaveLogBridgeHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _bridge: DaveLogCallbackBridge?
 
-    private static var activeBridge: DaveLogCallbackBridge? {
+    var bridge: DaveLogCallbackBridge? {
         get {
             lock.lock()
             defer { lock.unlock() }
-            return _activeBridge
+            return _bridge
         }
         set {
             lock.lock()
             defer { lock.unlock() }
-            _activeBridge = newValue
+            _bridge = newValue
         }
+    }
+}
+
+/// Global logging manager for the DAVE library.
+public final class DaveLogger: @unchecked Sendable {
+    private static let holder = DaveLogBridgeHolder()
+
+    private static var activeBridge: DaveLogCallbackBridge? {
+        get { holder.bridge }
+        set { holder.bridge = newValue }
     }
 
     /// Sets a global callback to receive log messages from the DAVE library.

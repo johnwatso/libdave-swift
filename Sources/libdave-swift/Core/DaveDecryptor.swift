@@ -2,7 +2,13 @@ import Foundation
 import CDave
 
 /// A decryptor for media frames (audio/video) in a DAVE session.
-public final class DaveDecryptor: @unchecked Sendable {
+///
+/// > Important: The underlying native decryptor is **not thread-safe**. All
+/// > calls on one `DaveDecryptor` must be externally serialized (one thread,
+/// > queue, or actor — `DaveSessionCoordinator` provides this). This type is
+/// > intentionally not `Sendable` so the compiler flags attempts to share it
+/// > across concurrency domains.
+public final class DaveDecryptor {
     internal let handle: DAVEDecryptorHandle
 
     /// Creates a new media frame decryptor.

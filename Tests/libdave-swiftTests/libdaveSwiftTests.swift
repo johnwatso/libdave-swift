@@ -151,7 +151,7 @@ final class libdaveSwiftTests: XCTestCase {
         // Before configuration
         var diagnostics = await coordinator.getDiagnostics()
         XCTAssertEqual(diagnostics.handshakeState, .uninitialized)
-        XCTAssertEqual(diagnostics.currentEpoch, 0)
+        XCTAssertEqual(diagnostics.appliedTransitionCount, 0)
         XCTAssertFalse(diagnostics.isExternalSenderRegistered)
 
         // Configure
@@ -170,7 +170,7 @@ final class libdaveSwiftTests: XCTestCase {
         await coordinator.reset()
         diagnostics = await coordinator.getDiagnostics()
         XCTAssertEqual(diagnostics.handshakeState, .uninitialized)
-        XCTAssertEqual(diagnostics.currentEpoch, 0)
+        XCTAssertEqual(diagnostics.appliedTransitionCount, 0)
         XCTAssertFalse(diagnostics.isExternalSenderRegistered)
     }
 
@@ -315,6 +315,87 @@ final class libdaveSwiftTests: XCTestCase {
         XCTAssertNil(diagnostics.pendingTransitionId)
         XCTAssertNil(diagnostics.pendingEpoch)
         XCTAssertEqual(diagnostics.lastRecoveryAction, .resumeMedia)
+    }
+
+    // MARK: - Inbound media (decrypt path)
+
+    // A true encrypted round-trip cannot run in unit tests: the native library
+    // only derives key ratchets once a real MLS group exists, which requires
+    // Discord's external sender to complete a handshake. Passthrough exercises
+    // the same coordinator decryptor lifecycle and native decrypt call.
+    func testCoordinatorPassthroughDecryptRoundTrip() async throws {
+        let coordinator = DaveSessionCoordinator(authSessionId: "decrypt-passthrough-test")
+        try await coordinator.configureForDiscordVoice(groupId: 6666, selfUserId: "user-666", protocolVersion: 1)
+        try await coordinator.setPassthroughMode(true)
+
+        let frame = Data([0x10, 0x20, 0x30, 0x40, 0x50])
+        let encrypted = try await coordinator.encryptDiscordAudioFrame(frame, ssrc: 777)
+        XCTAssertEqual(encrypted, frame)
+
+        // The remote user's decryptor is created lazily on first decrypt and
+        // follows the coordinator's passthrough mode.
+        let decrypted = try await coordinator.decryptDiscordAudioFrame(encrypted, from: "remote-user-1")
+        XCTAssertEqual(decrypted, frame)
+
+        let maybeStats = await coordinator.decryptorStats(for: "remote-user-1")
+        let stats = try XCTUnwrap(maybeStats)
+        XCTAssertEqual(stats.passthroughCount, 1)
+
+        // No decryptor exists for a user we never received a frame from.
+        let missing = await coordinator.decryptorStats(for: "remote-user-2")
+        XCTAssertNil(missing)
+    }
+
+    func testCoordinatorDecryptRequiresConfiguration() async throws {
+        let coordinator = DaveSessionCoordinator(authSessionId: "decrypt-unconfigured-test")
+        do {
+            _ = try await coordinator.decryptDiscordAudioFrame(Data([1, 2, 3]), from: "remote-user")
+            XCTFail("Should have thrown DaveError.notConfigured")
+        } catch let error as DaveError {
+            guard case .notConfigured = error else {
+                return XCTFail("Expected .notConfigured, got: \(error)")
+            }
+        }
+    }
+
+    func testCoordinatorDecryptWithoutRatchetThrowsTypedError() async throws {
+        let coordinator = DaveSessionCoordinator(authSessionId: "decrypt-no-ratchet-test")
+        try await coordinator.configureForDiscordVoice(groupId: 7777, selfUserId: "user-777", protocolVersion: 1)
+
+        // No MLS group is established, so the remote user has no ratchet and
+        // passthrough is off: decrypt must fail with a typed DaveError the
+        // host can map to a recovery hint, never trap or return garbage.
+        do {
+            _ = try await coordinator.decryptDiscordAudioFrame(Data([9, 9, 9, 9]), from: "remote-user")
+            XCTFail("Should have thrown DaveError.decryptionFailed")
+        } catch let error as DaveError {
+            guard case .decryptionFailed = error else {
+                return XCTFail("Expected .decryptionFailed, got: \(error)")
+            }
+        }
+    }
+
+    func testAsyncPairwiseFingerprint() async throws {
+        // Without an established MLS group the native library reports no
+        // fingerprint; the async wrappers must resume with nil, not hang.
+        let session = try DaveSession(authSessionId: "fingerprint-test") { _, _ in }
+        session.initialize(version: 1, groupId: 8888, selfUserId: "user-888")
+        let fingerprint = await session.pairwiseFingerprint(version: 0, userId: "remote-user")
+        XCTAssertNil(fingerprint)
+
+        let coordinator = DaveSessionCoordinator(authSessionId: "fingerprint-coordinator-test")
+        do {
+            _ = try await coordinator.pairwiseFingerprint(version: 0, userId: "remote-user")
+            XCTFail("Should have thrown DaveError.notConfigured before configuration")
+        } catch let error as DaveError {
+            guard case .notConfigured = error else {
+                return XCTFail("Expected .notConfigured, got: \(error)")
+            }
+        }
+
+        try await coordinator.configureForDiscordVoice(groupId: 8888, selfUserId: "user-888", protocolVersion: 1)
+        let coordinatorFingerprint = try await coordinator.pairwiseFingerprint(version: 0, userId: "remote-user")
+        XCTAssertNil(coordinatorFingerprint)
     }
 
     func testDaveErrorRecoveryHints() {

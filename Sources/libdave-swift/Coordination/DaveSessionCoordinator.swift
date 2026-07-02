@@ -20,6 +20,15 @@ public actor DaveSessionCoordinator {
     // Lifecycles owned by actor
     private var session: DaveSession?
     private var encryptor: DaveEncryptor?
+    /// One decryptor per remote user, created lazily on first decrypt and kept
+    /// in step with the MLS roster after each applied welcome/commit.
+    private var decryptors: [String: DaveDecryptor] = [:]
+    /// Passthrough mode requested by the host; applied to the encryptor and to
+    /// every current and future decryptor so both directions stay coherent.
+    private var passthroughMode: Bool = false
+    /// SSRCs already assigned to the Opus codec on the current encryptor, so
+    /// the per-frame encrypt path skips the redundant native assignment call.
+    private var assignedSsrcs: Set<UInt32> = []
 
     // Internal configurations
     private let authSessionId: String?
@@ -28,7 +37,7 @@ public actor DaveSessionCoordinator {
     
     // Internal state tracking
     private var protocolVersion: UInt16 = 0
-    private var currentEpoch: UInt64 = 0
+    private var appliedTransitionCount: UInt64 = 0
     private var handshakeState: DaveHandshakeState = .uninitialized
     private var lastMlsError: String?
     private var lastTransitionTimestamp: Date?
@@ -84,8 +93,12 @@ public actor DaveSessionCoordinator {
     public func reset() {
         session?.reset()
 
+        // Decryptors hold ratchets from the old session generation; drop them
+        // so stale keys can never decrypt frames from the next generation.
+        decryptors.removeAll()
+
         // Clear tracking state
-        currentEpoch = 0
+        appliedTransitionCount = 0
         handshakeState = .uninitialized
         lastMlsError = nil
         lastTransitionTimestamp = Date()
@@ -113,6 +126,10 @@ public actor DaveSessionCoordinator {
     /// Rebuilds only the encryptor, preserving session state but invalidating existing ratchets.
     public func rebuildEncryptor() throws {
         encryptor = try DaveEncryptor()
+        // The fresh native encryptor has no SSRC->codec assignments and
+        // defaults to passthrough off, so re-align both with tracked state.
+        assignedSsrcs.removeAll()
+        encryptor?.setPassthroughMode(passthroughMode)
         lastRecoveryAction = .rebuildEncryptor
 
         // Wire version changes to the actor safely
@@ -150,7 +167,7 @@ public actor DaveSessionCoordinator {
                 handshakeState = .failed
                 throw DaveError.invalidTransition(message: "Welcome payload was empty")
             }
-            guard session.processWelcome(welcomeData, recognizedUserIds: recognizedUserIds) != nil else {
+            guard let welcomeResult = session.processWelcome(welcomeData, recognizedUserIds: recognizedUserIds) else {
                 handshakeState = .failed
                 throw DaveError.handshakeFailed(reason: "Welcome processing failed\(nativeFailureSuffix(session))")
             }
@@ -165,8 +182,9 @@ public actor DaveSessionCoordinator {
                 try rebuildEncryptor()
             }
             encryptor?.setKeyRatchet(ratchet)
+            synchronizeDecryptors(rosterMemberIds: welcomeResult.rosterMemberIds)
 
-            currentEpoch += 1
+            appliedTransitionCount += 1
             handshakeState = .ready
             mediaReady = true
             pendingEpoch = nil
@@ -197,8 +215,9 @@ public actor DaveSessionCoordinator {
                     try rebuildEncryptor()
                 }
                 encryptor?.setKeyRatchet(ratchet)
+                synchronizeDecryptors(rosterMemberIds: commitResult.rosterMemberIds)
 
-                currentEpoch += 1
+                appliedTransitionCount += 1
             }
             handshakeState = .ready
             mediaReady = true
@@ -436,15 +455,59 @@ public actor DaveSessionCoordinator {
             throw DaveError.invalidState(message: "Encryptor is not initialized or ratchet is not set.")
         }
 
-        // Zero-configuration: automatically map new SSRCs to the Opus codec
-        encryptor.assignSsrcToCodec(ssrc: ssrc, codec: .opus)
+        // Zero-configuration: automatically map new SSRCs to the Opus codec.
+        // Assign once per SSRC; this runs per 20ms audio frame, so the native
+        // call is skipped for SSRCs already assigned on this encryptor.
+        if assignedSsrcs.insert(ssrc).inserted {
+            encryptor.assignSsrcToCodec(ssrc: ssrc, codec: .opus)
+        }
 
-        do {
-            return try encryptor.encrypt(mediaType: .audio, ssrc: ssrc, frame: frame)
-        } catch let error as DaveError {
-            throw error
-        } catch {
-            throw DaveError.encryptionFailed(reason: .encryptionFailure)
+        return try encryptor.encrypt(mediaType: .audio, ssrc: ssrc, frame: frame)
+    }
+
+    /// Decrypts an audio frame received from a remote Discord user.
+    ///
+    /// Decryptors are created lazily per remote user and are kept in step with
+    /// the MLS roster: after each applied welcome/commit they transition to the
+    /// user's ratchet for the new epoch, and users who left the roster have
+    /// their decryptors dropped.
+    ///
+    /// If the user's ratchet is not yet available (e.g. the frame raced an MLS
+    /// transition), the native decrypt fails and this throws
+    /// `DaveError.decryptionFailed(reason: .missingKeyRatchet)`, whose
+    /// `recoveryHint` is `.retryLater`.
+    /// - Parameters:
+    ///   - encryptedFrame: The encrypted frame bytes from the RTP payload.
+    ///   - userId: Discord user ID of the sender.
+    /// - Returns: Decrypted plaintext frame bytes.
+    public func decryptDiscordAudioFrame(_ encryptedFrame: Data, from userId: String) throws -> Data {
+        guard session != nil else {
+            throw DaveError.notConfigured
+        }
+        let decryptor = try decryptorForUser(userId)
+        return try decryptor.decrypt(mediaType: .audio, encryptedFrame: encryptedFrame)
+    }
+
+    /// Gets decryption statistics for a remote user's audio decryptor, if one exists.
+    public func decryptorStats(for userId: String) -> DaveDecryptorStats? {
+        decryptors[userId]?.stats(mediaType: .audio)
+    }
+
+    /// Computes a pairwise fingerprint for identity verification with another user.
+    ///
+    /// Returns `nil` when the native library produced no fingerprint (e.g. the
+    /// remote user is not in the current MLS group).
+    /// - Parameters:
+    ///   - version: Fingerprint format version to use.
+    ///   - userId: Discord user ID of the remote user.
+    public func pairwiseFingerprint(version: UInt16, userId: String) async throws -> Data? {
+        guard let session else {
+            throw DaveError.notConfigured
+        }
+        return await withCheckedContinuation { continuation in
+            session.getPairwiseFingerprint(version: version, userId: userId) { fingerprint in
+                continuation.resume(returning: fingerprint)
+            }
         }
     }
 
@@ -488,12 +551,18 @@ public actor DaveSessionCoordinator {
         return result
     }
 
-    /// Sets the encryptor's passthrough mode.
+    /// Sets passthrough mode for outbound and inbound media alike: the
+    /// encryptor, every existing per-user decryptor, and any decryptor created
+    /// later all follow this setting.
     public func setPassthroughMode(_ enabled: Bool) throws {
         guard let encryptor = encryptor else {
             throw DaveError.invalidState(message: "Encryptor is not initialized.")
         }
+        passthroughMode = enabled
         encryptor.setPassthroughMode(enabled)
+        for decryptor in decryptors.values {
+            decryptor.transitionToPassthroughMode(enabled)
+        }
     }
 
     /// Retrieves a snapshot of the current session diagnostics.
@@ -501,7 +570,7 @@ public actor DaveSessionCoordinator {
         let stats = encryptor?.stats(mediaType: .audio)
         return DaveDiagnostics(
             protocolVersion: protocolVersion,
-            currentEpoch: currentEpoch,
+            appliedTransitionCount: appliedTransitionCount,
             handshakeState: handshakeState,
             encryptionStats: stats,
             lastMlsError: lastMlsError,
@@ -533,6 +602,45 @@ public actor DaveSessionCoordinator {
         }
         handshakeState = .initialized
         lastTransitionTimestamp = Date()
+    }
+
+    /// Returns the decryptor for a remote user, creating one on first use with
+    /// the current passthrough mode and the user's ratchet when available.
+    private func decryptorForUser(_ userId: String) throws -> DaveDecryptor {
+        if let existing = decryptors[userId] {
+            return existing
+        }
+
+        let decryptor = try DaveDecryptor()
+        decryptor.transitionToPassthroughMode(passthroughMode)
+        if let session, let ratchet = session.getKeyRatchet(userId: userId) {
+            decryptor.transitionToKeyRatchet(ratchet)
+        }
+        decryptors[userId] = decryptor
+        return decryptor
+    }
+
+    /// Brings per-user decryptors in step with the roster after an applied
+    /// welcome/commit: users who left are dropped, remaining users transition
+    /// to their ratchet for the new epoch. Users who joined get a decryptor
+    /// lazily on their first decrypted frame.
+    private func synchronizeDecryptors(rosterMemberIds: [UInt64]) {
+        guard let session else { return }
+
+        let rosterUserIds = Set(rosterMemberIds.map(String.init))
+        for (userId, decryptor) in decryptors {
+            guard rosterUserIds.contains(userId) else {
+                decryptors[userId] = nil
+                continue
+            }
+            if let ratchet = session.getKeyRatchet(userId: userId) {
+                decryptor.transitionToKeyRatchet(ratchet)
+            } else {
+                // No ratchet for a user still in the roster: drop the stale
+                // decryptor; it is recreated (and re-keyed) on the next frame.
+                decryptors[userId] = nil
+            }
+        }
     }
 
     private func handleMLSFailure(source: String, reason: String) {
