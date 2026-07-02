@@ -20,7 +20,7 @@ final class libdaveSwiftTests: XCTestCase {
             XCTAssertNotNil(session, "Session should not be nil")
 
             // Initialize session with group details
-            session.initialize(version: 1, groupId: 12345, selfUserId: "user-123")
+            session.initialize(version: 1, groupId: 12345, selfUserId: "123456789012345678")
 
             // Verify version is as set
             XCTAssertEqual(session.protocolVersion, 1, "Session protocol version should be 1")
@@ -121,7 +121,7 @@ final class libdaveSwiftTests: XCTestCase {
 
     func testCoordinatorConcurrentPassthroughEncryption() async throws {
         let coordinator = DaveSessionCoordinator(authSessionId: "concurrent-test")
-        try await coordinator.configureForDiscordVoice(groupId: 12345, selfUserId: "user-123", protocolVersion: 1)
+        try await coordinator.configureForDiscordVoice(groupId: 12345, selfUserId: "123456789012345678", protocolVersion: 1)
         try await coordinator.setPassthroughMode(true)
 
         let originalFrame = Data([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
@@ -459,6 +459,90 @@ final class libdaveSwiftTests: XCTestCase {
         _ = await coordinator.markDiscordMediaReady(reason: "watchdog unit test complete")
         let inactive = await coordinator.evaluateMediaReadinessWatchdog(now: Date().addingTimeInterval(2))
         XCTAssertEqual(inactive, .inactive)
+    }
+
+    // MARK: - Persisted signature key pairs
+
+    /// A session configured with an `authSessionId` must be able to marshal
+    /// its MLS key package. This is the regression that shipped in builds
+    /// carrying the null persisted-key backend: `GetPersistedKeyPair`
+    /// returned nothing, leaf-node init aborted, and every key-package
+    /// request failed with "Failed to generate marshalled key package".
+    func testAuthSessionIdProducesKeyPackageAndPersistsKeyFile() async throws {
+        let keyStoreRoot = try makeTemporaryKeyStore()
+        defer { restoreKeyStoreEnvironment() }
+
+        let coordinator = DaveSessionCoordinator(authSessionId: "persist-test-\(UUID().uuidString)")
+        _ = try await coordinator.configureDiscordVoiceSession(
+            groupId: 424242,
+            selfUserId: "424242424242424242",
+            protocolVersion: 1
+        )
+
+        let keyPackage = try await coordinator.getMarshalledKeyPackage()
+        XCTAssertFalse(keyPackage.isEmpty, "session with authSessionId must yield a key package")
+
+        let storageDir = keyStoreRoot.appendingPathComponent("Discord Key Storage")
+        let stored = (try? FileManager.default.contentsOfDirectory(atPath: storageDir.path)) ?? []
+        XCTAssertFalse(stored.isEmpty, "a signature key file must be persisted to the key store")
+    }
+
+    /// The persisted key file must be reused, not regenerated, by later
+    /// sessions with the same auth session id.
+    func testPersistedKeyFileIsStableAcrossSessions() async throws {
+        let keyStoreRoot = try makeTemporaryKeyStore()
+        defer { restoreKeyStoreEnvironment() }
+
+        let authSessionId = "persist-stable-\(UUID().uuidString)"
+        let first = DaveSessionCoordinator(authSessionId: authSessionId)
+        _ = try await first.configureDiscordVoiceSession(groupId: 1, selfUserId: "111111111111111111", protocolVersion: 1)
+        _ = try await first.getMarshalledKeyPackage()
+
+        let storageDir = keyStoreRoot.appendingPathComponent("Discord Key Storage")
+        let files = try FileManager.default.contentsOfDirectory(atPath: storageDir.path)
+        let keyFile = try XCTUnwrap(files.first)
+        let originalContents = try Data(contentsOf: storageDir.appendingPathComponent(keyFile))
+
+        let second = DaveSessionCoordinator(authSessionId: authSessionId)
+        _ = try await second.configureDiscordVoiceSession(groupId: 2, selfUserId: "111111111111111111", protocolVersion: 1)
+        _ = try await second.getMarshalledKeyPackage()
+
+        let laterContents = try Data(contentsOf: storageDir.appendingPathComponent(keyFile))
+        XCTAssertEqual(originalContents, laterContents, "the persisted signature key must be reused, not rewritten")
+    }
+
+    /// Sessions with no auth session id keep working with ephemeral keys and
+    /// never touch the key store.
+    func testNilAuthSessionIdStillYieldsKeyPackage() async throws {
+        let keyStoreRoot = try makeTemporaryKeyStore()
+        defer { restoreKeyStoreEnvironment() }
+
+        let coordinator = DaveSessionCoordinator(authSessionId: nil)
+        _ = try await coordinator.configureDiscordVoiceSession(
+            groupId: 434343,
+            selfUserId: "434343434343434343",
+            protocolVersion: 1
+        )
+        let keyPackage = try await coordinator.getMarshalledKeyPackage()
+        XCTAssertFalse(keyPackage.isEmpty)
+
+        let storageDir = keyStoreRoot.appendingPathComponent("Discord Key Storage")
+        let stored = (try? FileManager.default.contentsOfDirectory(atPath: storageDir.path)) ?? []
+        XCTAssertTrue(stored.isEmpty, "ephemeral sessions must not write to the key store")
+    }
+
+    /// Point the generic key store at a fresh temp directory via
+    /// XDG_CONFIG_HOME (read by the backend on every lookup).
+    private func makeTemporaryKeyStore() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("libdave-keystore-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        setenv("XDG_CONFIG_HOME", root.path, 1)
+        return root
+    }
+
+    private func restoreKeyStoreEnvironment() {
+        unsetenv("XDG_CONFIG_HOME")
     }
 
     func testDiscordRecoveryReplayFixture() async throws {

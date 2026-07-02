@@ -27,6 +27,7 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 * **Self-Contained Integration:** All C++ core logic, Cisco's MLS library (`mlspp`), and OpenSSL 3.0 are statically precompiled into a unified `Dave.xcframework`. No external build tools (like CMake or vcpkg) are required by client applications.
 * **Type-Safe Swift Interfaces:** Raw C pointers and manual allocations are mapped behind standard Swift classes (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`).
 * **High-Level Coordinator:** `DaveSessionCoordinator` is an `actor` that orchestrates the session, key ratchets, and media crypto behind one async API, exposing handshake state and `DaveDiagnostics`.
+* **Persistent Signature Identity:** Passing an `authSessionId` gives the session a persisted MLS signature key pair (stored under `$XDG_CONFIG_HOME`/`~/.config` in `Discord Key Storage/`), so the client keeps a stable identity across reconnects — matching official Discord clients. Passing `nil` uses a fresh ephemeral identity per session.
 * **Full-Duplex Media:** The coordinator handles both directions — `encryptDiscordAudioFrame` for outbound audio and `decryptDiscordAudioFrame(_:from:)` for inbound, with one decryptor per remote speaker kept in step with the MLS roster after every welcome/commit.
 * **Discord Action Flow:** Coordinator helpers emit typed outbound actions for Discord Voice gateway messages such as MLS key packages, commit/welcome payloads, transition-ready, and invalid commit/welcome recovery.
 * **Recovery Diagnostics:** Typed recovery hints, external sender state, pending epoch/transition tracking, and a media-readiness watchdog make stalled DAVE transitions visible without parsing logs.
@@ -45,7 +46,7 @@ Add the dependency to your project in Xcode, or append it to your `Package.swift
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/johnwatso/libdave-swift.git", from: "1.2.0")
+    .package(url: "https://github.com/johnwatso/libdave-swift.git", from: "1.3.1")
 ]
 ```
 
