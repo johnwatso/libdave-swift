@@ -11,6 +11,10 @@ public enum DaveHandshakeState: String, Codable, Sendable {
 
 /// Lightweight diagnostics exposing session state and encryption health.
 public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
+    /// Monotonic identifier for the native MLS session currently owned by the
+    /// coordinator. It changes after reset/recovery and is useful for
+    /// correlating gateway logs without exposing key material.
+    public let sessionGeneration: UInt64
     public let protocolVersion: UInt16
     /// Number of MLS transitions (welcome/commit) this coordinator has applied
     /// to the current session generation.
@@ -26,15 +30,27 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
     public let encryptionStats: DaveEncryptorStats?
     public let lastMlsError: String?
     public let lastTransitionTimestamp: Date?
+    /// `true` means non-empty bytes were submitted to the native session. The
+    /// current C API returns no parse status, so this is not cryptographic
+    /// confirmation that the external sender was accepted.
     public let isExternalSenderRegistered: Bool
     public let mediaReady: Bool
     public let pendingEpoch: UInt64?
     public let pendingTransitionId: UInt64?
+    /// Transition currently used by outbound media. A non-nil pending list
+    /// means newer ratchets have been staged but are not active until Execute.
+    public let activeTransitionId: UInt64?
+    public let pendingTransitionIds: [UInt64]
     public let externalSenderState: DaveExternalSenderState
     public let lastRecoveryAction: DaveRecoveryAction?
+    /// `true` after a key package has been generated/queued. It becomes
+    /// `hasSentInitialKeyPackage` only after the host acknowledges delivery.
+    public let hasIssuedInitialKeyPackage: Bool
     public let hasSentInitialKeyPackage: Bool
+    public let pendingOutboundActionCount: Int
 
     public init(
+        sessionGeneration: UInt64 = 0,
         protocolVersion: UInt16,
         appliedTransitionCount: UInt64,
         handshakeState: DaveHandshakeState,
@@ -45,10 +61,15 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         mediaReady: Bool = false,
         pendingEpoch: UInt64? = nil,
         pendingTransitionId: UInt64? = nil,
+        activeTransitionId: UInt64? = nil,
+        pendingTransitionIds: [UInt64] = [],
         externalSenderState: DaveExternalSenderState = .missing,
         lastRecoveryAction: DaveRecoveryAction? = nil,
-        hasSentInitialKeyPackage: Bool = false
+        hasIssuedInitialKeyPackage: Bool = false,
+        hasSentInitialKeyPackage: Bool = false,
+        pendingOutboundActionCount: Int = 0
     ) {
+        self.sessionGeneration = sessionGeneration
         self.protocolVersion = protocolVersion
         self.appliedTransitionCount = appliedTransitionCount
         self.handshakeState = handshakeState
@@ -59,9 +80,13 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         self.mediaReady = mediaReady
         self.pendingEpoch = pendingEpoch
         self.pendingTransitionId = pendingTransitionId
+        self.activeTransitionId = activeTransitionId
+        self.pendingTransitionIds = pendingTransitionIds
         self.externalSenderState = externalSenderState
         self.lastRecoveryAction = lastRecoveryAction
+        self.hasIssuedInitialKeyPackage = hasIssuedInitialKeyPackage
         self.hasSentInitialKeyPackage = hasSentInitialKeyPackage
+        self.pendingOutboundActionCount = pendingOutboundActionCount
     }
 
     public var debugDescription: String {
@@ -72,6 +97,7 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         }
         return """
         DaveDiagnostics:
+          Session Generation: \(sessionGeneration)
           Protocol Version: \(protocolVersion)
           Applied Transitions: \(appliedTransitionCount)
           Handshake State: \(handshakeState.rawValue)
@@ -80,8 +106,12 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
           External Sender State: \(externalSenderState.rawValue)
           Pending Epoch: \(pendingEpoch.map(String.init) ?? "None")
           Pending Transition ID: \(pendingTransitionId.map(String.init) ?? "None")
+          Active Transition ID: \(activeTransitionId.map(String.init) ?? "None")
+          Staged Transition IDs: \(pendingTransitionIds.map(String.init).joined(separator: ", "))
           Last Recovery Action: \(lastRecoveryAction?.rawValue ?? "None")
+          Initial Key Package Issued: \(hasIssuedInitialKeyPackage)
           Initial Key Package Sent: \(hasSentInitialKeyPackage)
+          Pending Gateway Actions: \(pendingOutboundActionCount)
           Last MLS Error: \(lastMlsError ?? "None")
           Last Transition Timestamp: \(timestampStr)
           Encryption Stats (Audio): \(statsStr)

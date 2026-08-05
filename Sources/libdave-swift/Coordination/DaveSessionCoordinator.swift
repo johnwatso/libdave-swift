@@ -1,8 +1,44 @@
 import Foundation
+import CryptoKit
 import CDave
 
 /// High-level actor orchestrating the DAVE/MLS session, key ratchets, and media encryption.
 public actor DaveSessionCoordinator {
+    private enum TransitionKind: String {
+        case externalSender
+        case proposals
+        case welcome
+        case commit
+        case execute
+        case prepareEpoch
+    }
+
+    /// The next outbound ratchet is deliberately kept separate from the active
+    /// encryptor. Discord requires senders to keep using the old media context
+    /// until the matching Execute Transition arrives.
+    private struct StagedTransition {
+        let transitionId: UInt64
+        let outboundRatchet: DaveKeyRatchet?
+        let protocolVersion: UInt16
+        let source: TransitionKind
+        var executeSeen: Bool
+    }
+
+    private struct TransitionLedgerEntry {
+        let kind: TransitionKind
+        let transitionId: UInt64?
+        let payloadDigest: Data?
+        let actions: [DiscordDaveOutboundAction]
+        let recoveryHint: DaveRecoveryHint
+        var outboundActionIDs: [UUID]
+    }
+
+    private struct ProcessedMlsTransition {
+        let kind: TransitionKind
+        let didApply: Bool
+        let outboundRatchet: DaveKeyRatchet?
+    }
+
     /// Dedicated serial executor backing this actor.
     ///
     /// The DAVE/MLS calls underneath are synchronous, blocking C++/OpenSSL
@@ -20,6 +56,11 @@ public actor DaveSessionCoordinator {
     // Lifecycles owned by actor
     private var session: DaveSession?
     private var encryptor: DaveEncryptor?
+    /// Ratchet installed on `encryptor` and currently used to encrypt outbound
+    /// media. This is retained independently of `session`, whose MLS state may
+    /// already have advanced to a staged future epoch.
+    private var activeOutboundRatchet: DaveKeyRatchet?
+    private var activeTransitionId: UInt64?
     /// One decryptor per remote user, created lazily on first decrypt and kept
     /// in step with the MLS roster after each applied welcome/commit.
     private var decryptors: [String: DaveDecryptor] = [:]
@@ -29,9 +70,31 @@ public actor DaveSessionCoordinator {
     /// SSRCs already assigned to the Opus codec on the current encryptor, so
     /// the per-frame encrypt path skips the redundant native assignment call.
     private var assignedSsrcs: Set<UInt32> = []
+    /// Monotonically increasing identity for the current encryptor. Native
+    /// callbacks can arrive after an encryptor is torn down, so callbacks use
+    /// this value to avoid mutating state for a replacement instance.
+    private var encryptorGeneration: UInt64 = 0
+    /// Monotonically increasing identity for the current MLS session. Native
+    /// failure callbacks can arrive after recovery has replaced a session, so
+    /// callback work carries this value before it touches coordinator state.
+    private var sessionGeneration: UInt64 = 0
+
+    /// Newer ratchets indexed by their Discord transition ID. They are only
+    /// installed into the outbound encryptor at Execute Transition.
+    private var stagedTransitions: [UInt64: StagedTransition] = [:]
+    private var stagedTransitionOrder: [UInt64] = []
+    /// A bounded replay ledger makes gateway resume/replay idempotent without
+    /// handing the same MLS commit/welcome to native code twice.
+    private var transitionLedger: [String: TransitionLedgerEntry] = [:]
+    private var transitionLedgerOrder: [String] = []
+    /// A bounded outbox lets the host retry the exact generated gateway bytes
+    /// if a WebSocket write fails before it is acknowledged.
+    private var pendingOutboundActions: [UUID: DiscordDaveOutboundAction] = [:]
+    private var pendingOutboundActionOrder: [UUID] = []
 
     // Internal configurations
     private let authSessionId: String?
+    private let limits: DaveCoordinatorLimits
     private var groupId: UInt64?
     private var selfUserId: String?
     
@@ -47,16 +110,20 @@ public actor DaveSessionCoordinator {
     private var mediaReady: Bool = false
     private var pendingEpoch: UInt64?
     private var pendingTransitionId: UInt64?
+    private var pendingProtocolVersion: UInt16?
     private var lastRecoveryAction: DaveRecoveryAction?
+    private var hasIssuedInitialKeyPackage: Bool = false
     private var hasSentInitialKeyPackage: Bool = false
     private var mediaReadinessWatchdogStartedAt: Date?
     private var mediaReadinessWatchdogTimeout: TimeInterval = 10
     private var mediaReadinessWatchdogReason: String?
+    private var mediaReadinessWatchdogTask: Task<Void, Never>?
 
     /// Creates a new coordinator.
     /// - Parameter authSessionId: Optional identifier for managing persistent key lifetimes.
-    public init(authSessionId: String? = nil) {
+    public init(authSessionId: String? = nil, limits: DaveCoordinatorLimits = .default) {
         self.authSessionId = authSessionId
+        self.limits = limits
     }
 
     /// Configures the coordinator specifically for Discord Voice usage.
@@ -65,6 +132,9 @@ public actor DaveSessionCoordinator {
     ///   - selfUserId: The local client user ID.
     ///   - protocolVersion: The target protocol version (e.g. 1).
     public func configureForDiscordVoice(groupId: UInt64, selfUserId: String, protocolVersion: UInt16) throws {
+        try validateDiscordGroupId(groupId)
+        try validateDiscordUserId(selfUserId)
+        try validateProtocolVersion(protocolVersion)
         self.groupId = groupId
         self.selfUserId = selfUserId
         self.protocolVersion = protocolVersion
@@ -91,11 +161,26 @@ public actor DaveSessionCoordinator {
 
     /// Resets the MLS session state using the native library's reset capabilities.
     public func reset() {
+        // Invalidate callbacks from this session before reset/destroy can cause
+        // them to run. A recovery must never be poisoned by an old failure.
+        sessionGeneration &+= 1
         session?.reset()
 
-        // Decryptors hold ratchets from the old session generation; drop them
-        // so stale keys can never decrypt frames from the next generation.
+        // All cryptors hold ratchets from the old session generation. Drop
+        // both directions so media fails closed until the next MLS transition
+        // installs fresh ratchets.
+        encryptorGeneration &+= 1
+        encryptor = nil
+        activeOutboundRatchet = nil
+        activeTransitionId = nil
         decryptors.removeAll()
+        assignedSsrcs.removeAll()
+        stagedTransitions.removeAll()
+        stagedTransitionOrder.removeAll()
+        transitionLedger.removeAll()
+        transitionLedgerOrder.removeAll()
+        pendingOutboundActions.removeAll()
+        pendingOutboundActionOrder.removeAll()
 
         // Clear tracking state
         appliedTransitionCount = 0
@@ -108,7 +193,9 @@ public actor DaveSessionCoordinator {
         mediaReady = false
         pendingEpoch = nil
         pendingTransitionId = nil
+        pendingProtocolVersion = nil
         lastRecoveryAction = .reset
+        hasIssuedInitialKeyPackage = false
         hasSentInitialKeyPackage = false
         clearMediaReadinessWatchdog()
     }
@@ -125,107 +212,60 @@ public actor DaveSessionCoordinator {
 
     /// Rebuilds only the encryptor, preserving session state but invalidating existing ratchets.
     public func rebuildEncryptor() throws {
-        encryptor = try DaveEncryptor()
+        encryptorGeneration &+= 1
+        let generation = encryptorGeneration
+        // Tear down the old native state before a throwing allocation so a
+        // failed rebuild cannot leave an encryptor using a prior ratchet.
+        encryptor = nil
+        assignedSsrcs.removeAll()
+        let replacementEncryptor = try DaveEncryptor()
+        encryptor = replacementEncryptor
         // The fresh native encryptor has no SSRC->codec assignments and
         // defaults to passthrough off, so re-align both with tracked state.
-        assignedSsrcs.removeAll()
         encryptor?.setPassthroughMode(passthroughMode)
         lastRecoveryAction = .rebuildEncryptor
 
         // Wire version changes to the actor safely
-        encryptor?.setProtocolVersionChangedCallback { [weak self] in
+        replacementEncryptor.setProtocolVersionChangedCallback { [weak self] in
             guard let self = self else { return }
             Task {
-                await self.handleProtocolVersionChanged()
+                await self.handleProtocolVersionChanged(from: generation)
             }
         }
 
-        // Reapply ratchet if we have one in the session
-        if let session = session, let selfUserId = selfUserId {
-            if let ratchet = session.getKeyRatchet(userId: selfUserId) {
-                encryptor?.setKeyRatchet(ratchet)
-            }
+        // Reapply only the active ratchet. The native MLS session may already
+        // be ahead of outbound media while a future ratchet waits for Execute.
+        if let activeOutboundRatchet {
+            encryptor?.setKeyRatchet(activeOutboundRatchet)
         }
 
         lastTransitionTimestamp = Date()
     }
 
     /// Processes an MLS transition for Discord Voice (e.g., Welcome or Commit).
-    /// Automatically performs ratchet transitions.
+    ///
+    /// This legacy, low-level entry point has no Discord transition ID, so it
+    /// cannot defer outbound activation until Execute. Prefer
+    /// ``processDiscordWelcomeForOutbound(_:transitionId:recognizedUserIds:recoveryTimeout:)``,
+    /// ``processDiscordCommitForOutbound(_:transitionId:recoveryTimeout:)``, or
+    /// ``consumeDiscordGatewayEvent(_:)`` for production voice clients.
     /// - Parameter transition: The welcome or commit transition data.
+    @available(
+        *,
+        deprecated,
+        message: "This legacy API has no Discord transition ID. Use consumeDiscordGatewayEvent(_:) or the transition-ID-aware Welcome/Commit helpers."
+    )
     public func processDiscordTransition(_ transition: DiscordTransition) throws {
-        guard let session = session, let selfUserId = selfUserId else {
-            throw DaveError.notConfigured
-        }
-
-        handshakeState = .handshaking
-        lastTransitionTimestamp = Date()
-
-        switch transition {
-        case .welcome(let welcomeData, let recognizedUserIds):
-            guard !welcomeData.isEmpty else {
-                handshakeState = .failed
-                throw DaveError.invalidTransition(message: "Welcome payload was empty")
-            }
-            guard let welcomeResult = session.processWelcome(welcomeData, recognizedUserIds: recognizedUserIds) else {
-                handshakeState = .failed
-                throw DaveError.handshakeFailed(reason: "Welcome processing failed\(nativeFailureSuffix(session))")
-            }
-
-            // Manage ratchet transition for our user
-            guard let ratchet = session.getKeyRatchet(userId: selfUserId) else {
-                handshakeState = .failed
-                throw DaveError.ratchetFailed(userId: selfUserId, reason: "Could not retrieve key ratchet after welcome")
-            }
-
-            if encryptor == nil {
-                try rebuildEncryptor()
-            }
-            encryptor?.setKeyRatchet(ratchet)
-            synchronizeDecryptors(rosterMemberIds: welcomeResult.rosterMemberIds)
-
-            appliedTransitionCount += 1
-            handshakeState = .ready
-            mediaReady = true
-            pendingEpoch = nil
-            pendingTransitionId = nil
-            lastMlsError = nil
-            lastRecoveryAction = .processWelcome
-            clearMediaReadinessWatchdog()
-
-        case .commit(let commitData):
-            guard !commitData.isEmpty else {
-                handshakeState = .failed
-                throw DaveError.invalidTransition(message: "Commit payload was empty")
-            }
-            let commitResult = session.processCommit(commitData)
-            if commitResult.isFailed {
-                handshakeState = .failed
-                throw DaveError.handshakeFailed(reason: "Commit processing failed\(nativeFailureSuffix(session))")
-            }
-
-            if !commitResult.isIgnored {
-                // Manage ratchet transition for our user
-                guard let ratchet = session.getKeyRatchet(userId: selfUserId) else {
-                    handshakeState = .failed
-                    throw DaveError.ratchetFailed(userId: selfUserId, reason: "Could not retrieve key ratchet after commit")
-                }
-
-                if encryptor == nil {
-                    try rebuildEncryptor()
-                }
-                encryptor?.setKeyRatchet(ratchet)
-                synchronizeDecryptors(rosterMemberIds: commitResult.rosterMemberIds)
-
-                appliedTransitionCount += 1
-            }
-            handshakeState = .ready
-            mediaReady = true
-            pendingEpoch = nil
-            pendingTransitionId = nil
-            lastMlsError = nil
-            lastRecoveryAction = .processCommit
-            clearMediaReadinessWatchdog()
+        do {
+            let processed = try processMlsTransition(transition)
+            guard processed.didApply, let ratchet = processed.outboundRatchet else { return }
+            activateOutboundRatchet(ratchet, transitionId: nil, reason: "legacy \(processed.kind.rawValue) processing")
+            // The old API cannot associate the update with Execute. Fail closed
+            // after activation rather than falsely claiming media is ready.
+            beginMediaReadinessWait(reason: "Legacy \(processed.kind.rawValue) applied; transition ID was not supplied")
+        } catch {
+            failClosed(reason: "MLS transition failed: \(error.localizedDescription)")
+            throw error
         }
     }
 
@@ -248,12 +288,15 @@ public actor DaveSessionCoordinator {
     }
 
     /// Emits the initial key package action exactly once for this session
-    /// generation. Prefer `registerDiscordExternalSender(_:publishInitialKeyPackage:)`;
-    /// this method exists for clients that intentionally use a delayed fallback.
+    /// generation. An external sender is always required: Discord rejects MLS
+    /// group creation without it, so a timer-based fallback is not safe.
     @discardableResult
     public func publishDiscordInitialKeyPackage() throws -> DiscordDaveTransitionResult {
         var actions: [DiscordDaveOutboundAction] = []
-        if let keyPackageAction = try makeInitialKeyPackageActionIfNeeded(requireExternalSender: false) {
+        guard externalSenderState == .registered else {
+            throw DaveError.externalSenderRequired
+        }
+        if let keyPackageAction = try makeInitialKeyPackageActionIfNeeded(requireExternalSender: true) {
             actions.append(keyPackageAction)
         }
         return makeDiscordResult(actions: actions)
@@ -262,6 +305,7 @@ public actor DaveSessionCoordinator {
     /// Marks the current generation's initial key package as already published
     /// for callers that still send `getMarshalledKeyPackage()` manually.
     public func markInitialKeyPackageSent() {
+        hasIssuedInitialKeyPackage = true
         hasSentInitialKeyPackage = true
         lastRecoveryAction = .sendInitialKeyPackage
         lastTransitionTimestamp = Date()
@@ -287,11 +331,53 @@ public actor DaveSessionCoordinator {
         recognizedUserIds: [String],
         recoveryTimeout: TimeInterval = 10
     ) throws -> DiscordDaveTransitionResult {
+        if let cached = cachedTransitionResult(
+            kind: .welcome,
+            transitionId: transitionId,
+            payload: welcome
+        ) {
+            return cached
+        }
         do {
-            try processDiscordTransition(.welcome(welcome, recognizedUserIds: recognizedUserIds))
-            return makeDiscordResult(actions: [.transitionReady(transitionId)])
+            try validateMlsTransitionIdentity(
+                kind: .welcome,
+                transitionId: transitionId,
+                payload: welcome
+            )
+            try ensureTransitionLedgerCapacity(
+                for: ledgerKey(kind: .welcome, transitionId: transitionId, payload: welcome)
+            )
+            let processed = try processMlsTransition(.welcome(welcome, recognizedUserIds: recognizedUserIds))
+            if processed.didApply, let ratchet = processed.outboundRatchet {
+                let executeAlreadySeen = try stageOutboundTransition(
+                    id: transitionId,
+                    ratchet: ratchet,
+                    source: .welcome,
+                    protocolVersion: pendingProtocolVersion ?? protocolVersion
+                )
+                if executeAlreadySeen {
+                    activateStagedTransition(transitionId, reason: "Execute arrived before welcome")
+                } else if activeOutboundRatchet == nil {
+                    beginMediaReadinessWait(
+                        reason: "Welcome applied; waiting for Execute Transition \(transitionId)",
+                        timeout: recoveryTimeout
+                    )
+                }
+            }
+            let result = makeDiscordResult(actions: [.transitionReady(transitionId)])
+            storeTransitionResult(
+                kind: .welcome,
+                transitionId: transitionId,
+                payload: welcome,
+                actions: result.outboundActions,
+                recoveryHint: result.recoveryHint
+            )
+            return result
         } catch let error as DaveError where error.recoveryHint == .sendInvalidCommitWelcome {
             return try recoverDiscordInvalidTransition(transitionId: transitionId, timeout: recoveryTimeout)
+        } catch {
+            failClosed(reason: "Welcome \(transitionId) failed: \(error.localizedDescription)")
+            throw error
         }
     }
 
@@ -303,11 +389,53 @@ public actor DaveSessionCoordinator {
         transitionId: UInt64,
         recoveryTimeout: TimeInterval = 10
     ) throws -> DiscordDaveTransitionResult {
+        if let cached = cachedTransitionResult(
+            kind: .commit,
+            transitionId: transitionId,
+            payload: commit
+        ) {
+            return cached
+        }
         do {
-            try processDiscordTransition(.commit(commit))
-            return makeDiscordResult(actions: [.transitionReady(transitionId)])
+            try validateMlsTransitionIdentity(
+                kind: .commit,
+                transitionId: transitionId,
+                payload: commit
+            )
+            try ensureTransitionLedgerCapacity(
+                for: ledgerKey(kind: .commit, transitionId: transitionId, payload: commit)
+            )
+            let processed = try processMlsTransition(.commit(commit))
+            if processed.didApply, let ratchet = processed.outboundRatchet {
+                let executeAlreadySeen = try stageOutboundTransition(
+                    id: transitionId,
+                    ratchet: ratchet,
+                    source: .commit,
+                    protocolVersion: pendingProtocolVersion ?? protocolVersion
+                )
+                if executeAlreadySeen {
+                    activateStagedTransition(transitionId, reason: "Execute arrived before commit")
+                } else if activeOutboundRatchet == nil {
+                    beginMediaReadinessWait(
+                        reason: "Commit applied; waiting for Execute Transition \(transitionId)",
+                        timeout: recoveryTimeout
+                    )
+                }
+            }
+            let result = makeDiscordResult(actions: [.transitionReady(transitionId)])
+            storeTransitionResult(
+                kind: .commit,
+                transitionId: transitionId,
+                payload: commit,
+                actions: result.outboundActions,
+                recoveryHint: result.recoveryHint
+            )
+            return result
         } catch let error as DaveError where error.recoveryHint == .sendInvalidCommitWelcome {
             return try recoverDiscordInvalidTransition(transitionId: transitionId, timeout: recoveryTimeout)
+        } catch {
+            failClosed(reason: "Commit \(transitionId) failed: \(error.localizedDescription)")
+            throw error
         }
     }
 
@@ -315,42 +443,145 @@ public actor DaveSessionCoordinator {
     /// once MLS processing has installed a ratchet and the coordinator is ready.
     @discardableResult
     public func executeDiscordTransition(_ transitionId: UInt64) -> DiscordDaveTransitionResult {
-        guard handshakeState == .ready else {
-            mediaReady = false
-            pendingTransitionId = transitionId
-            lastTransitionTimestamp = Date()
-            return makeDiscordResult(recoveryHint: .retryLater)
+        guard handshakeState != .failed else {
+            return makeDiscordResult(recoveryHint: .recreateSession)
+        }
+        if let cached = cachedTransitionResult(kind: .execute, transitionId: transitionId, payload: nil) {
+            return cached
         }
 
-        _ = markDiscordMediaReady(reason: "execute transition \(transitionId)")
-        return makeDiscordResult()
+        // A repeated Execute for the currently active context is a benign
+        // gateway replay. Do not create a placeholder that could later be
+        // mistaken for a fresh MLS transition after the ledger is pruned.
+        if activeTransitionId == transitionId {
+            let result = makeDiscordResult()
+            storeTransitionResult(
+                kind: .execute,
+                transitionId: transitionId,
+                payload: nil,
+                actions: result.outboundActions,
+                recoveryHint: result.recoveryHint
+            )
+            return result
+        }
+
+        if stagedTransitions[transitionId] != nil {
+            activateStagedTransition(transitionId, reason: "execute transition \(transitionId)")
+            let result = makeDiscordResult()
+            storeTransitionResult(
+                kind: .execute,
+                transitionId: transitionId,
+                payload: nil,
+                actions: result.outboundActions,
+                recoveryHint: result.recoveryHint
+            )
+            return result
+        }
+
+        // Gateway v8 may deliver a buffered Execute before the corresponding
+        // binary commit/welcome. Retain the signal; staging the matching MLS
+        // transition later activates it immediately.
+        stageExecuteBeforeMls(transitionId)
+        if activeOutboundRatchet == nil {
+            beginMediaReadinessWait(reason: "Execute Transition \(transitionId) arrived before MLS was ready")
+        }
+        let result = makeDiscordResult(recoveryHint: .retryLater)
+        storeTransitionResult(
+            kind: .execute,
+            transitionId: transitionId,
+            payload: nil,
+            actions: result.outboundActions,
+            recoveryHint: result.recoveryHint
+        )
+        return result
     }
 
-    /// Prepares a fresh Discord DAVE epoch, preserving a cached external sender
-    /// when available and emitting a new key package action for the recreated
-    /// MLS session.
+    /// Prepares a Discord DAVE epoch. Epoch `1` creates/recreates an MLS group
+    /// and therefore needs a new key package. Later epochs retain the active
+    /// outbound ratchet until the subsequent matching Execute Transition.
     @discardableResult
     public func prepareDiscordEpoch(
         protocolVersion: UInt16,
         epoch: UInt64,
+        transitionId: UInt64,
         timeout: TimeInterval = 10
     ) throws -> DiscordDaveTransitionResult {
         guard groupId != nil, selfUserId != nil else {
             throw DaveError.notConfigured
         }
+        try ensureAcceptingGatewayEvents()
+        guard epoch > 0 else {
+            throw DaveError.invalidTransition(message: "Prepare Epoch must be greater than zero")
+        }
+        try validateProtocolVersion(protocolVersion)
+
+        if epoch > 1 {
+            do {
+                // A retained-group protocol change must not tear down working
+                // media. Prepare new receive and send contexts, but keep the
+                // current outbound ratchet active until the *matching* Execute
+                // Transition authorizes it.
+                guard let session, let selfUserId else {
+                    throw DaveError.notConfigured
+                }
+                session.setProtocolVersion(version: protocolVersion)
+                pendingProtocolVersion = protocolVersion
+                pendingEpoch = epoch
+
+                try prepareExistingDecryptorsForCurrentSession()
+                guard let ratchet = session.getKeyRatchet(userId: selfUserId) else {
+                    throw DaveError.ratchetFailed(
+                        userId: selfUserId,
+                        reason: "Could not prepare key ratchet for protocol transition"
+                    )
+                }
+                let executeAlreadySeen = try stageOutboundTransition(
+                    id: transitionId,
+                    ratchet: ratchet,
+                    source: .prepareEpoch,
+                    protocolVersion: protocolVersion
+                )
+                if executeAlreadySeen {
+                    activateStagedTransition(
+                        transitionId,
+                        reason: "Execute arrived before Prepare Epoch"
+                    )
+                } else if activeOutboundRatchet == nil {
+                    beginMediaReadinessWait(
+                        reason: "Prepare Epoch \(epoch); waiting for Execute Transition \(transitionId)",
+                        timeout: timeout
+                    )
+                }
+                lastRecoveryAction = .prepareProtocolVersion
+                lastTransitionTimestamp = Date()
+                return makeDiscordResult(actions: [.transitionReady(transitionId)])
+            } catch {
+                failClosed(reason: "Prepare Epoch \(epoch) failed: \(error.localizedDescription)")
+                throw error
+            }
+        }
 
         let cachedExternalSender = externalSenderData
+        // A resumed gateway can deliver Execute before its corresponding
+        // Prepare Epoch. Recreating an epoch-1 group clears old MLS state, but
+        // must not discard that authorization signal; the later Welcome/Commit
+        // will consume this placeholder and activate immediately.
+        let executeAlreadySeen = stagedTransitions[transitionId]?.executeSeen ?? false
         self.protocolVersion = protocolVersion
         try recreateSessionState()
+        if executeAlreadySeen {
+            stageExecuteBeforeMls(transitionId)
+        }
 
         var actions: [DiscordDaveOutboundAction] = []
         if let cachedExternalSender {
             try setExternalSender(cachedExternalSender)
-            appendInitialKeyPackageActionIfAvailable(to: &actions, requireExternalSender: true)
+            try appendInitialKeyPackageActionIfAvailable(to: &actions, requireExternalSender: true)
         }
 
         _ = markDiscordMediaNotReady(
             reason: "prepare epoch \(epoch)",
+            pendingTransitionId: transitionId,
             pendingEpoch: epoch,
             timeout: timeout
         )
@@ -375,7 +606,7 @@ public actor DaveSessionCoordinator {
         var actions: [DiscordDaveOutboundAction] = [.invalidCommitWelcome(transitionId)]
         if let cachedExternalSender {
             try setExternalSender(cachedExternalSender)
-            appendInitialKeyPackageActionIfAvailable(to: &actions, requireExternalSender: true)
+            try appendInitialKeyPackageActionIfAvailable(to: &actions, requireExternalSender: true)
         }
 
         _ = markDiscordMediaNotReady(
@@ -400,24 +631,40 @@ public actor DaveSessionCoordinator {
         pendingEpoch: UInt64? = nil,
         timeout: TimeInterval = 10
     ) -> DaveMediaReadinessWatchdogStatus {
+        guard handshakeState != .failed else {
+            return .timedOut(reason: "DAVE session failed closed", recoveryHint: .recreateSession)
+        }
         mediaReady = false
-        if let pendingTransitionId {
-            self.pendingTransitionId = pendingTransitionId
-        }
-        if let pendingEpoch {
-            self.pendingEpoch = pendingEpoch
-        }
+        // A generic pause must not retain an unrelated old ID: otherwise a
+        // later valid Execute can be rejected forever as a false mismatch.
+        self.pendingTransitionId = pendingTransitionId
+        self.pendingEpoch = pendingEpoch
         mediaReadinessWatchdogStartedAt = Date()
         mediaReadinessWatchdogTimeout = max(0, timeout)
         mediaReadinessWatchdogReason = reason
         lastRecoveryAction = .pauseMedia
         lastTransitionTimestamp = Date()
+        scheduleMediaReadinessWatchdog()
         return evaluateMediaReadinessWatchdog()
     }
 
     /// Marks DAVE media as ready and clears any pending readiness watchdog.
     @discardableResult
+    @available(
+        *,
+        deprecated,
+        message: "Use executeDiscordTransition(_:) or consumeDiscordGatewayEvent(_:) so readiness is bound to Discord's matching transition ID."
+    )
     public func markDiscordMediaReady(reason: String? = nil) -> DaveMediaReadinessWatchdogStatus {
+        guard handshakeState != .failed else {
+            return .timedOut(reason: "DAVE session failed closed", recoveryHint: .recreateSession)
+        }
+        // This remains for advanced/manual integrations and passthrough tests,
+        // but it must not override a known staged transition. Production voice
+        // clients should call `executeDiscordTransition` instead.
+        guard pendingTransitionId == nil, stagedTransitions.isEmpty else {
+            return evaluateMediaReadinessWatchdog()
+        }
         mediaReady = true
         pendingEpoch = nil
         pendingTransitionId = nil
@@ -451,6 +698,12 @@ public actor DaveSessionCoordinator {
     ///   - ssrc: Synchronization Source (SSRC) identifier.
     /// - Returns: Encrypted ciphertext frame bytes.
     public func encryptDiscordAudioFrame(_ frame: Data, ssrc: UInt32) throws -> Data {
+        guard frame.count <= limits.maximumMediaFrameBytes else {
+            throw DaveError.invalidMediaFrameSize(actual: frame.count, maximum: limits.maximumMediaFrameBytes)
+        }
+        guard mediaReady else {
+            throw DaveError.mediaNotReady
+        }
         guard let encryptor = encryptor else {
             throw DaveError.invalidState(message: "Encryptor is not initialized or ratchet is not set.")
         }
@@ -481,9 +734,16 @@ public actor DaveSessionCoordinator {
     ///   - userId: Discord user ID of the sender.
     /// - Returns: Decrypted plaintext frame bytes.
     public func decryptDiscordAudioFrame(_ encryptedFrame: Data, from userId: String) throws -> Data {
+        guard encryptedFrame.count <= limits.maximumMediaFrameBytes else {
+            throw DaveError.invalidMediaFrameSize(actual: encryptedFrame.count, maximum: limits.maximumMediaFrameBytes)
+        }
         guard session != nil else {
             throw DaveError.notConfigured
         }
+        guard mediaReady else {
+            throw DaveError.mediaNotReady
+        }
+        try validateDiscordUserId(userId)
         let decryptor = try decryptorForUser(userId)
         return try decryptor.decrypt(mediaType: .audio, encryptedFrame: encryptedFrame)
     }
@@ -504,6 +764,7 @@ public actor DaveSessionCoordinator {
         guard let session else {
             throw DaveError.notConfigured
         }
+        try validateDiscordUserId(userId)
         return await withCheckedContinuation { continuation in
             session.getPairwiseFingerprint(version: version, userId: userId) { fingerprint in
                 continuation.resume(returning: fingerprint)
@@ -511,12 +772,37 @@ public actor DaveSessionCoordinator {
         }
     }
 
-    /// Sets the external sender credentials.
+    /// Submits external-sender credentials to the native session.
+    ///
+    /// The bundled C API returns no parse status. Synchronously reported native
+    /// failures are detected before any key package can be issued; a late
+    /// native failure still fails the coordinator closed through its callback.
     public func setExternalSender(_ externalSender: Data) throws {
+        try ensureAcceptingGatewayEvents()
         guard let session = session else {
             throw DaveError.notConfigured
         }
+        guard !externalSender.isEmpty else {
+            throw DaveError.invalidExternalSender
+        }
+        try validateMlsPayload(externalSender, kind: "external sender")
+
+        if let current = externalSenderData {
+            guard current == externalSender else {
+                failClosed(reason: "Conflicting external sender payload")
+                throw DaveError.externalSenderConflict
+            }
+            // Replayed external-sender events are already represented in the
+            // coordinator's action ledger. Avoid passing duplicate bytes to
+            // native MLS when callers use this low-level helper directly.
+            return
+        }
         session.setExternalSender(externalSender)
+        if let failure = session.takeLastMLSFailure() {
+            let reason = "\(failure.source): \(failure.reason)"
+            failClosed(reason: "External sender rejected by native MLS: \(reason)")
+            throw DaveError.externalSenderRejected(reason: reason)
+        }
         isExternalSenderRegistered = true
         externalSenderState = .registered
         externalSenderData = externalSender
@@ -526,26 +812,32 @@ public actor DaveSessionCoordinator {
 
     /// Gets the marshalled MLS key package.
     public func getMarshalledKeyPackage() throws -> Data {
+        try ensureAcceptingGatewayEvents()
         guard let session = session else {
             throw DaveError.notConfigured
         }
         guard let keyPackage = session.marshalledKeyPackage else {
             throw DaveError.invalidState(message: "Failed to generate marshalled key package")
         }
+        try validateMlsPayload(keyPackage, kind: "key package")
         return keyPackage
     }
 
     /// Processes MLS proposals and generates commit/welcome messages.
     public func processProposals(_ proposals: Data, recognizedUserIds: [String]) throws -> Data {
+        try ensureAcceptingGatewayEvents()
         guard let session = session else {
             throw DaveError.notConfigured
         }
         guard !proposals.isEmpty else {
             throw DaveError.invalidTransition(message: "Proposals payload was empty")
         }
+        try validateMlsPayload(proposals, kind: "proposals")
+        try validateDiscordUserIds(recognizedUserIds)
         guard let result = session.processProposals(proposals, recognizedUserIds: recognizedUserIds) else {
             throw DaveError.invalidState(message: "Proposals processing failed\(nativeFailureSuffix(session))")
         }
+        try validateMlsPayload(result, kind: "commit/welcome")
         lastRecoveryAction = .processProposals
         lastTransitionTimestamp = Date()
         return result
@@ -569,6 +861,7 @@ public actor DaveSessionCoordinator {
     public func getDiagnostics() -> DaveDiagnostics {
         let stats = encryptor?.stats(mediaType: .audio)
         return DaveDiagnostics(
+            sessionGeneration: sessionGeneration,
             protocolVersion: protocolVersion,
             appliedTransitionCount: appliedTransitionCount,
             handshakeState: handshakeState,
@@ -579,19 +872,539 @@ public actor DaveSessionCoordinator {
             mediaReady: mediaReady,
             pendingEpoch: pendingEpoch,
             pendingTransitionId: pendingTransitionId,
+            activeTransitionId: activeTransitionId,
+            pendingTransitionIds: stagedTransitionOrder,
             externalSenderState: externalSenderState,
             lastRecoveryAction: lastRecoveryAction,
-            hasSentInitialKeyPackage: hasSentInitialKeyPackage
+            hasIssuedInitialKeyPackage: hasIssuedInitialKeyPackage,
+            hasSentInitialKeyPackage: hasSentInitialKeyPackage,
+            pendingOutboundActionCount: pendingOutboundActionOrder.count
         )
+    }
+
+    /// Consumes a DAVE/MLS gateway event through the coordinator-owned,
+    /// replay-safe state machine. Use this API in new voice clients instead of
+    /// independently calling the per-message helpers.
+    ///
+    /// Returned actions stay in the bounded outbox until each WebSocket write
+    /// succeeds and the host calls ``acknowledgeDiscordGatewayAction(_:)``.
+    @discardableResult
+    public func consumeDiscordGatewayEvent(_ event: DiscordDaveGatewayEvent) throws -> DiscordDaveGatewayResult {
+        let result: DiscordDaveTransitionResult
+        let key: String
+
+        switch event {
+        case .externalSender(let sender):
+            key = ledgerKey(kind: .externalSender, transitionId: nil, payload: sender)
+            if let cached = cachedLedgerResult(for: key, kind: .externalSender, transitionId: nil, payload: sender) {
+                return makeGatewayResult(for: key, fallback: cached)
+            }
+            try ensureTransitionLedgerCapacity(for: key)
+            result = try registerDiscordExternalSender(sender)
+            storeLedgerResult(
+                key: key,
+                kind: .externalSender,
+                transitionId: nil,
+                payload: sender,
+                actions: result.outboundActions,
+                recoveryHint: result.recoveryHint
+            )
+
+        case .proposals(let proposals, let recognizedUserIds):
+            key = ledgerKey(kind: .proposals, transitionId: nil, payload: proposals)
+            if let cached = cachedLedgerResult(for: key, kind: .proposals, transitionId: nil, payload: proposals) {
+                return makeGatewayResult(for: key, fallback: cached)
+            }
+            try ensureTransitionLedgerCapacity(for: key)
+            result = try processDiscordProposalsForOutbound(proposals, recognizedUserIds: recognizedUserIds)
+            storeLedgerResult(
+                key: key,
+                kind: .proposals,
+                transitionId: nil,
+                payload: proposals,
+                actions: result.outboundActions,
+                recoveryHint: result.recoveryHint
+            )
+
+        case .welcome(let welcome, let transitionId, let recognizedUserIds):
+            key = ledgerKey(kind: .welcome, transitionId: transitionId, payload: welcome)
+            result = try processDiscordWelcomeForOutbound(
+                welcome,
+                transitionId: transitionId,
+                recognizedUserIds: recognizedUserIds
+            )
+            // Invalid-transition recovery recreates the session and therefore
+            // clears its normal high-level ledger entry. Reinsert the emitted
+            // recovery action here so a gateway replay reuses the same outbox
+            // envelope instead of re-running native MLS recovery.
+            if transitionLedger[key] == nil {
+                storeLedgerResult(
+                    key: key,
+                    kind: .welcome,
+                    transitionId: transitionId,
+                    payload: welcome,
+                    actions: result.outboundActions,
+                    recoveryHint: result.recoveryHint
+                )
+            }
+
+        case .commit(let commit, let transitionId):
+            key = ledgerKey(kind: .commit, transitionId: transitionId, payload: commit)
+            result = try processDiscordCommitForOutbound(commit, transitionId: transitionId)
+            if transitionLedger[key] == nil {
+                storeLedgerResult(
+                    key: key,
+                    kind: .commit,
+                    transitionId: transitionId,
+                    payload: commit,
+                    actions: result.outboundActions,
+                    recoveryHint: result.recoveryHint
+                )
+            }
+
+        case .executeTransition(let transitionId):
+            key = ledgerKey(kind: .execute, transitionId: transitionId, payload: nil)
+            result = executeDiscordTransition(transitionId)
+
+        case .prepareEpoch(let protocolVersion, let epoch, let transitionId):
+            key = ledgerKey(
+                kind: .prepareEpoch,
+                transitionId: transitionId,
+                payload: Data("\(protocolVersion):\(epoch)".utf8)
+            )
+            if let cached = cachedLedgerResult(
+                for: key,
+                kind: .prepareEpoch,
+                transitionId: transitionId,
+                payload: Data("\(protocolVersion):\(epoch)".utf8)
+            ) {
+                return makeGatewayResult(for: key, fallback: cached)
+            }
+            try ensureTransitionLedgerCapacity(for: key)
+            result = try prepareDiscordEpoch(
+                protocolVersion: protocolVersion,
+                epoch: epoch,
+                transitionId: transitionId
+            )
+            storeLedgerResult(
+                key: key,
+                kind: .prepareEpoch,
+                transitionId: transitionId,
+                payload: Data("\(protocolVersion):\(epoch)".utf8),
+                actions: result.outboundActions,
+                recoveryHint: result.recoveryHint
+            )
+        }
+
+        return makeGatewayResult(for: key, fallback: result)
+    }
+
+    /// Returns undelivered gateway actions in deterministic send order.
+    public func pendingDiscordGatewayActions() -> [DiscordDaveOutboundActionEnvelope] {
+        pendingOutboundActionOrder.compactMap { id in
+            pendingOutboundActions[id].map { DiscordDaveOutboundActionEnvelope(id: id, action: $0) }
+        }
+    }
+
+    /// Acknowledges that one outbox action was successfully written to the
+    /// voice gateway. Unknown/previously acknowledged IDs are harmless no-ops.
+    public func acknowledgeDiscordGatewayAction(_ id: UUID) {
+        guard let action = pendingOutboundActions.removeValue(forKey: id) else { return }
+        pendingOutboundActionOrder.removeAll { $0 == id }
+        if case .mlsKeyPackage = action {
+            hasSentInitialKeyPackage = true
+        }
+        lastRecoveryAction = .acknowledgeOutboundAction
+        lastTransitionTimestamp = Date()
     }
 
     // MARK: - Private Helpers
 
+    private func processMlsTransition(_ transition: DiscordTransition) throws -> ProcessedMlsTransition {
+        try ensureAcceptingGatewayEvents()
+        guard let session, let selfUserId else {
+            throw DaveError.notConfigured
+        }
+
+        handshakeState = .handshaking
+        lastTransitionTimestamp = Date()
+
+        switch transition {
+        case .welcome(let welcomeData, let recognizedUserIds):
+            guard !welcomeData.isEmpty else {
+                throw DaveError.invalidTransition(message: "Welcome payload was empty")
+            }
+            try validateMlsPayload(welcomeData, kind: "welcome")
+            try validateDiscordUserIds(recognizedUserIds)
+            guard let welcomeResult = session.processWelcome(welcomeData, recognizedUserIds: recognizedUserIds) else {
+                throw DaveError.handshakeFailed(reason: "Welcome processing failed\(nativeFailureSuffix(session))")
+            }
+            guard let ratchet = session.getKeyRatchet(userId: selfUserId) else {
+                throw DaveError.ratchetFailed(userId: selfUserId, reason: "Could not retrieve key ratchet after welcome")
+            }
+
+            if encryptor == nil {
+                try rebuildEncryptor()
+            }
+            // Receivers prepare the new ratchets before Execute; the native
+            // transition API retains prior receive context for in-flight media.
+            try validateRosterCount(welcomeResult.rosterMemberIds.count)
+            synchronizeDecryptors(rosterMemberIds: welcomeResult.rosterMemberIds)
+            appliedTransitionCount &+= 1
+            handshakeState = .ready
+            lastMlsError = nil
+            lastRecoveryAction = .processWelcome
+            return ProcessedMlsTransition(kind: .welcome, didApply: true, outboundRatchet: ratchet)
+
+        case .commit(let commitData):
+            guard !commitData.isEmpty else {
+                throw DaveError.invalidTransition(message: "Commit payload was empty")
+            }
+            try validateMlsPayload(commitData, kind: "commit")
+            let commitResult = session.processCommit(commitData)
+            if commitResult.isFailed {
+                throw DaveError.handshakeFailed(reason: "Commit processing failed\(nativeFailureSuffix(session))")
+            }
+
+            guard !commitResult.isIgnored else {
+                handshakeState = .ready
+                lastMlsError = nil
+                lastRecoveryAction = .processCommit
+                return ProcessedMlsTransition(kind: .commit, didApply: false, outboundRatchet: nil)
+            }
+            guard let ratchet = session.getKeyRatchet(userId: selfUserId) else {
+                throw DaveError.ratchetFailed(userId: selfUserId, reason: "Could not retrieve key ratchet after commit")
+            }
+
+            if encryptor == nil {
+                try rebuildEncryptor()
+            }
+            try validateRosterCount(commitResult.rosterMemberIds.count)
+            synchronizeDecryptors(rosterMemberIds: commitResult.rosterMemberIds)
+            appliedTransitionCount &+= 1
+            handshakeState = .ready
+            lastMlsError = nil
+            lastRecoveryAction = .processCommit
+            return ProcessedMlsTransition(kind: .commit, didApply: true, outboundRatchet: ratchet)
+        }
+    }
+
+    /// Stages a future outbound ratchet while preserving the currently active
+    /// one. Returns whether Execute was already received for this transition.
+    private func stageOutboundTransition(
+        id: UInt64,
+        ratchet: DaveKeyRatchet,
+        source: TransitionKind,
+        protocolVersion: UInt16
+    ) throws -> Bool {
+        let executeSeen = stagedTransitions[id]?.executeSeen ?? false
+        if let existing = stagedTransitions[id], existing.outboundRatchet != nil {
+            guard existing.source == source, existing.protocolVersion == protocolVersion else {
+                failClosed(reason: "Conflicting staged transition \(id)")
+                throw DaveError.transitionConflict(transitionId: id)
+            }
+            return existing.executeSeen
+        }
+
+        if !stagedTransitionOrder.contains(id),
+           stagedTransitionOrder.count >= limits.maximumTrackedTransitions {
+            failClosed(reason: "Exceeded the configured staged-transition limit")
+            throw DaveError.payloadTooLarge(
+                kind: "staged transition ledger",
+                maximum: limits.maximumTrackedTransitions,
+                actual: stagedTransitionOrder.count + 1
+            )
+        }
+
+        stagedTransitions[id] = StagedTransition(
+            transitionId: id,
+            outboundRatchet: ratchet,
+            protocolVersion: protocolVersion,
+            source: source,
+            executeSeen: executeSeen
+        )
+        if !stagedTransitionOrder.contains(id) {
+            stagedTransitionOrder.append(id)
+            trimStagedTransitionsIfNeeded()
+        }
+        refreshPendingTransitionID()
+        lastRecoveryAction = .stageTransition
+        lastTransitionTimestamp = Date()
+        return executeSeen
+    }
+
+    /// Records a premature Execute without inventing a ratchet. The matching
+    /// commit/welcome replaces this placeholder and activates immediately.
+    private func stageExecuteBeforeMls(_ transitionId: UInt64) {
+        if var existing = stagedTransitions[transitionId] {
+            existing.executeSeen = true
+            stagedTransitions[transitionId] = existing
+        } else {
+            guard stagedTransitionOrder.count < limits.maximumTrackedTransitions else {
+                failClosed(reason: "Exceeded the configured staged-transition limit")
+                return
+            }
+            stagedTransitions[transitionId] = StagedTransition(
+                transitionId: transitionId,
+                outboundRatchet: nil,
+                protocolVersion: pendingProtocolVersion ?? protocolVersion,
+                source: .execute,
+                executeSeen: true
+            )
+            stagedTransitionOrder.append(transitionId)
+            trimStagedTransitionsIfNeeded()
+        }
+        refreshPendingTransitionID()
+        lastTransitionTimestamp = Date()
+    }
+
+    @discardableResult
+    private func activateStagedTransition(_ transitionId: UInt64, reason: String) -> Bool {
+        guard let staged = stagedTransitions[transitionId], let ratchet = staged.outboundRatchet else {
+            return false
+        }
+        guard let encryptor else {
+            failClosed(reason: "No encryptor available to activate transition \(transitionId)")
+            return false
+        }
+
+        encryptor.setKeyRatchet(ratchet)
+        activeOutboundRatchet = ratchet
+        activeTransitionId = transitionId
+        protocolVersion = staged.protocolVersion
+        if pendingProtocolVersion == staged.protocolVersion {
+            pendingProtocolVersion = nil
+        }
+        pendingEpoch = nil
+        stagedTransitions[transitionId] = nil
+        stagedTransitionOrder.removeAll { $0 == transitionId }
+        refreshPendingTransitionID()
+        mediaReady = true
+        clearMediaReadinessWatchdog()
+        markExecuteTransitionActivated(transitionId)
+        lastRecoveryAction = .activateTransition
+        lastTransitionTimestamp = Date()
+        return true
+    }
+
+    /// Legacy activation path for integrations which have not supplied Discord
+    /// transition IDs. It intentionally leaves media paused; only the caller's
+    /// explicit readiness signal can resume it. New integrations must use the
+    /// staged `Execute Transition` path above.
+    private func activateOutboundRatchet(
+        _ ratchet: DaveKeyRatchet,
+        transitionId: UInt64?,
+        reason: String
+    ) {
+        guard let encryptor else {
+            failClosed(reason: "No encryptor available to activate legacy transition")
+            return
+        }
+        encryptor.setKeyRatchet(ratchet)
+        activeOutboundRatchet = ratchet
+        activeTransitionId = transitionId
+        mediaReady = false
+        lastRecoveryAction = .activateTransition
+        lastTransitionTimestamp = Date()
+    }
+
+    private func refreshPendingTransitionID() {
+        pendingTransitionId = stagedTransitionOrder.first
+    }
+
+    private func trimStagedTransitionsIfNeeded() {
+        // Capacity is checked before insertion. Keep this helper as a defensive
+        // backstop for future call sites rather than silently evicting state.
+        guard stagedTransitionOrder.count <= limits.maximumTrackedTransitions else {
+            failClosed(reason: "Exceeded the configured staged-transition limit")
+            return
+        }
+        refreshPendingTransitionID()
+    }
+
+    private func payloadDigest(_ payload: Data?) -> Data? {
+        payload.map { Data(SHA256.hash(data: $0)) }
+    }
+
+    private func ledgerKey(
+        kind: TransitionKind,
+        transitionId: UInt64?,
+        payload: Data?,
+        discriminator: String? = nil
+    ) -> String {
+        let id = transitionId.map(String.init) ?? "-"
+        let digest = payloadDigest(payload)?.base64EncodedString() ?? "-"
+        // Transition IDs identify a single MLS state change. Keep their ledger
+        // key independent of bytes so same-ID/different-payload is detected as
+        // a fail-closed conflict rather than treated as a second transition.
+        if transitionId != nil {
+            return "\(discriminator ?? kind.rawValue):\(id)"
+        }
+        return "\(discriminator ?? kind.rawValue):\(digest)"
+    }
+
+    private func cachedTransitionResult(
+        kind: TransitionKind,
+        transitionId: UInt64,
+        payload: Data?
+    ) -> DiscordDaveTransitionResult? {
+        let key = ledgerKey(kind: kind, transitionId: transitionId, payload: payload)
+        guard let entry = transitionLedger[key] else { return nil }
+        guard entry.payloadDigest == payloadDigest(payload) else {
+            failClosed(reason: "Conflicting payload for transition \(transitionId)")
+            return makeDiscordResult(recoveryHint: .recreateSession)
+        }
+        return makeDiscordResult(actions: entry.actions, recoveryHint: entry.recoveryHint)
+    }
+
+    private func cachedLedgerResult(
+        for key: String,
+        kind: TransitionKind,
+        transitionId: UInt64?,
+        payload: Data?
+    ) -> DiscordDaveTransitionResult? {
+        guard let entry = transitionLedger[key] else { return nil }
+        guard entry.kind == kind,
+              entry.transitionId == transitionId,
+              entry.payloadDigest == payloadDigest(payload) else {
+            failClosed(reason: "Conflicting replay ledger entry for \(kind.rawValue)")
+            return makeDiscordResult(recoveryHint: .recreateSession)
+        }
+        return makeDiscordResult(actions: entry.actions, recoveryHint: entry.recoveryHint)
+    }
+
+    /// A transition ID represents one MLS update. Welcome and Commit are
+    /// mutually exclusive payload types for that update; accepting both under
+    /// the same ID would let a replay advance native state twice.
+    private func validateMlsTransitionIdentity(
+        kind: TransitionKind,
+        transitionId: UInt64,
+        payload: Data
+    ) throws {
+        guard let existing = transitionLedger.values.first(where: {
+            $0.transitionId == transitionId && ($0.kind == .welcome || $0.kind == .commit)
+        }) else {
+            return
+        }
+
+        guard existing.kind == kind, existing.payloadDigest == payloadDigest(payload) else {
+            failClosed(reason: "Conflicting MLS transition identity \(transitionId)")
+            throw DaveError.transitionConflict(transitionId: transitionId)
+        }
+    }
+
+    private func ensureTransitionLedgerCapacity(for key: String) throws {
+        guard transitionLedger[key] == nil else { return }
+        guard transitionLedger.count < limits.maximumTrackedTransitions else {
+            failClosed(reason: "Exceeded the configured transition replay-ledger limit")
+            throw DaveError.payloadTooLarge(
+                kind: "transition replay ledger",
+                maximum: limits.maximumTrackedTransitions,
+                actual: transitionLedger.count + 1
+            )
+        }
+    }
+
+    private func markExecuteTransitionActivated(_ transitionId: UInt64) {
+        let key = ledgerKey(kind: .execute, transitionId: transitionId, payload: nil)
+        guard let entry = transitionLedger[key] else { return }
+        transitionLedger[key] = TransitionLedgerEntry(
+            kind: entry.kind,
+            transitionId: entry.transitionId,
+            payloadDigest: entry.payloadDigest,
+            actions: entry.actions,
+            recoveryHint: .none,
+            outboundActionIDs: entry.outboundActionIDs
+        )
+    }
+
+    private func storeTransitionResult(
+        kind: TransitionKind,
+        transitionId: UInt64,
+        payload: Data?,
+        actions: [DiscordDaveOutboundAction],
+        recoveryHint: DaveRecoveryHint
+    ) {
+        let key = ledgerKey(kind: kind, transitionId: transitionId, payload: payload)
+        storeLedgerResult(
+            key: key,
+            kind: kind,
+            transitionId: transitionId,
+            payload: payload,
+            actions: actions,
+            recoveryHint: recoveryHint
+        )
+    }
+
+    private func storeLedgerResult(
+        key: String,
+        kind: TransitionKind,
+        transitionId: UInt64?,
+        payload: Data?,
+        actions: [DiscordDaveOutboundAction],
+        recoveryHint: DaveRecoveryHint
+    ) {
+        if transitionLedger[key] == nil {
+            guard transitionLedger.count < limits.maximumTrackedTransitions else {
+                failClosed(reason: "Exceeded the configured transition replay-ledger limit")
+                return
+            }
+            transitionLedgerOrder.append(key)
+        }
+        let existingActionIDs = transitionLedger[key]?.outboundActionIDs ?? []
+        transitionLedger[key] = TransitionLedgerEntry(
+            kind: kind,
+            transitionId: transitionId,
+            payloadDigest: payloadDigest(payload),
+            actions: actions,
+            recoveryHint: recoveryHint,
+            outboundActionIDs: existingActionIDs
+        )
+    }
+
+    private func makeGatewayResult(
+        for key: String,
+        fallback: DiscordDaveTransitionResult
+    ) -> DiscordDaveGatewayResult {
+        var actionIDs = transitionLedger[key]?.outboundActionIDs ?? []
+        if actionIDs.isEmpty, !fallback.outboundActions.isEmpty {
+            for action in fallback.outboundActions {
+                guard pendingOutboundActionOrder.count < limits.maximumPendingOutboundActions else {
+                    failClosed(reason: "Exceeded the configured outbound-action limit")
+                    break
+                }
+                let id = UUID()
+                pendingOutboundActions[id] = action
+                pendingOutboundActionOrder.append(id)
+                actionIDs.append(id)
+            }
+            if var entry = transitionLedger[key] {
+                entry.outboundActionIDs = actionIDs
+                transitionLedger[key] = entry
+            }
+            if !actionIDs.isEmpty {
+                lastRecoveryAction = .queueOutboundAction
+                lastTransitionTimestamp = Date()
+            }
+        }
+
+        let envelopes = actionIDs.compactMap { id in
+            pendingOutboundActions[id].map { DiscordDaveOutboundActionEnvelope(id: id, action: $0) }
+        }
+        return DiscordDaveGatewayResult(
+            pendingActions: envelopes,
+            mediaReady: mediaReady,
+            recoveryHint: fallback.recoveryHint,
+            diagnostics: getDiagnostics()
+        )
+    }
+
     private func initializeSession(groupId: UInt64, selfUserId: String) throws {
+        sessionGeneration &+= 1
+        let generation = sessionGeneration
         session = try DaveSession(authSessionId: authSessionId) { [weak self] source, reason in
-            guard let self = self else { return }
-            Task {
-                await self.handleMLSFailure(source: source, reason: reason)
+            Task { [weak self] in
+                await self?.handleMLSFailure(source: source, reason: reason, generation: generation)
             }
         }
 
@@ -611,6 +1424,14 @@ public actor DaveSessionCoordinator {
             return existing
         }
 
+        guard decryptors.count < limits.maximumRosterMembers else {
+            throw DaveError.payloadTooLarge(
+                kind: "remote decryptor roster",
+                maximum: limits.maximumRosterMembers,
+                actual: decryptors.count + 1
+            )
+        }
+
         let decryptor = try DaveDecryptor()
         decryptor.transitionToPassthroughMode(passthroughMode)
         if let session, let ratchet = session.getKeyRatchet(userId: userId) {
@@ -628,7 +1449,8 @@ public actor DaveSessionCoordinator {
         guard let session else { return }
 
         let rosterUserIds = Set(rosterMemberIds.map(String.init))
-        for (userId, decryptor) in decryptors {
+        for userId in Array(decryptors.keys) {
+            guard let decryptor = decryptors[userId] else { continue }
             guard rosterUserIds.contains(userId) else {
                 decryptors[userId] = nil
                 continue
@@ -643,9 +1465,58 @@ public actor DaveSessionCoordinator {
         }
     }
 
-    private func handleMLSFailure(source: String, reason: String) {
-        lastMlsError = "Source: \(source), Reason: \(reason)"
+    /// Prepares receive-side transforms for a retained MLS group whose DAVE
+    /// protocol version is changing. Native decryptors retain the prior
+    /// ratchet briefly, so in-flight frames remain decryptable while outgoing
+    /// media continues on `activeOutboundRatchet` until Execute arrives.
+    private func prepareExistingDecryptorsForCurrentSession() throws {
+        guard let session else { throw DaveError.notConfigured }
+
+        for userId in Array(decryptors.keys) {
+            guard let decryptor = decryptors[userId] else { continue }
+            guard let ratchet = session.getKeyRatchet(userId: userId) else {
+                decryptors[userId] = nil
+                continue
+            }
+            decryptor.transitionToKeyRatchet(ratchet)
+        }
+    }
+
+    private func handleMLSFailure(source: String, reason: String, generation: UInt64) {
+        guard generation == sessionGeneration else { return }
+        failClosed(reason: "Source: \(source), Reason: \(reason)")
+    }
+
+    /// Native MLS failures must revoke media capability immediately. Leaving an
+    /// existing encryptor live after an asynchronous failure risks sending on a
+    /// stale ratchet even though diagnostics say the handshake failed.
+    private func failClosed(reason: String) {
+        encryptorGeneration &+= 1
+        encryptor = nil
+        activeOutboundRatchet = nil
+        activeTransitionId = nil
+        decryptors.removeAll()
+        assignedSsrcs.removeAll()
+        stagedTransitions.removeAll()
+        stagedTransitionOrder.removeAll()
+        // These actions and replay entries are bound to the failed native
+        // session generation. Keeping them would let a reconnect send a key
+        // package, commit, or transition-ready signal for invalidated state.
+        transitionLedger.removeAll()
+        transitionLedgerOrder.removeAll()
+        pendingOutboundActions.removeAll()
+        pendingOutboundActionOrder.removeAll()
+        hasIssuedInitialKeyPackage = false
+        hasSentInitialKeyPackage = false
+        mediaReady = false
+        pendingEpoch = nil
+        pendingTransitionId = nil
+        pendingProtocolVersion = nil
+        clearMediaReadinessWatchdog()
         handshakeState = .failed
+        lastMlsError = reason
+        lastRecoveryAction = .failClosed
+        lastTransitionTimestamp = Date()
     }
 
     /// Drains the most recent native MLS failure (reported via the failure
@@ -658,15 +1529,19 @@ public actor DaveSessionCoordinator {
     }
 
     private func makeInitialKeyPackageActionIfNeeded(requireExternalSender: Bool) throws -> DiscordDaveOutboundAction? {
-        guard !hasSentInitialKeyPackage else {
+        // Generating an action and delivering it are separate operations.  The
+        // outbox may need to retry after a failed WebSocket write, and asking
+        // native MLS for a second package here would create different bytes for
+        // what Discord considers the same initial state.
+        guard !hasIssuedInitialKeyPackage else {
             return nil
         }
         if requireExternalSender, externalSenderState != .registered {
-            return nil
+            throw DaveError.externalSenderRequired
         }
 
         let keyPackage = try getMarshalledKeyPackage()
-        hasSentInitialKeyPackage = true
+        hasIssuedInitialKeyPackage = true
         lastRecoveryAction = .sendInitialKeyPackage
         lastTransitionTimestamp = Date()
         return .mlsKeyPackage(keyPackage)
@@ -675,13 +1550,9 @@ public actor DaveSessionCoordinator {
     private func appendInitialKeyPackageActionIfAvailable(
         to actions: inout [DiscordDaveOutboundAction],
         requireExternalSender: Bool
-    ) {
-        do {
-            if let keyPackageAction = try makeInitialKeyPackageActionIfNeeded(requireExternalSender: requireExternalSender) {
-                actions.append(keyPackageAction)
-            }
-        } catch {
-            lastMlsError = "Failed to generate initial key package: \(error.localizedDescription)"
+    ) throws {
+        if let keyPackageAction = try makeInitialKeyPackageActionIfNeeded(requireExternalSender: requireExternalSender) {
+            actions.append(keyPackageAction)
         }
     }
 
@@ -698,14 +1569,145 @@ public actor DaveSessionCoordinator {
     }
 
     private func clearMediaReadinessWatchdog() {
+        mediaReadinessWatchdogTask?.cancel()
+        mediaReadinessWatchdogTask = nil
         mediaReadinessWatchdogStartedAt = nil
         mediaReadinessWatchdogTimeout = 10
         mediaReadinessWatchdogReason = nil
     }
 
-    private func handleProtocolVersionChanged() {
-        if let encryptor = encryptor {
-            self.protocolVersion = encryptor.protocolVersion
+    /// Keeps media paused after installing a new ratchet until Discord confirms
+    /// the matching Execute Transition. Preserve an existing watchdog (which
+    /// carries the transition ID supplied by the high-level gateway helper).
+    private func beginMediaReadinessWait(reason: String, timeout: TimeInterval = 10) {
+        mediaReady = false
+        if mediaReadinessWatchdogStartedAt == nil {
+            mediaReadinessWatchdogStartedAt = Date()
+            mediaReadinessWatchdogTimeout = max(0, timeout)
+            mediaReadinessWatchdogReason = reason
+            scheduleMediaReadinessWatchdog()
+        }
+    }
+
+    /// Turns the pull-style watchdog state into an actual safety boundary. A
+    /// stalled gateway transition must revoke media rather than leaving the
+    /// application silently transmitting on an indeterminate MLS state.
+    private func scheduleMediaReadinessWatchdog() {
+        mediaReadinessWatchdogTask?.cancel()
+        mediaReadinessWatchdogTask = nil
+
+        guard let startedAt = mediaReadinessWatchdogStartedAt else { return }
+        let timeout = mediaReadinessWatchdogTimeout
+        let generation = sessionGeneration
+
+        if timeout <= 0 {
+            mediaReadinessWatchdogTask = Task { [weak self] in
+                await self?.expireMediaReadinessWatchdog(
+                    sessionGeneration: generation,
+                    startedAt: startedAt
+                )
+            }
+            return
+        }
+
+        mediaReadinessWatchdogTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(timeout))
+            } catch {
+                return
+            }
+            await self?.expireMediaReadinessWatchdog(
+                sessionGeneration: generation,
+                startedAt: startedAt
+            )
+        }
+    }
+
+    private func expireMediaReadinessWatchdog(sessionGeneration: UInt64, startedAt: Date) {
+        guard sessionGeneration == self.sessionGeneration,
+              mediaReadinessWatchdogStartedAt == startedAt,
+              case .timedOut(let reason, _) = evaluateMediaReadinessWatchdog() else {
+            return
+        }
+        failClosed(reason: "DAVE media readiness watchdog expired: \(reason)")
+    }
+
+    /// Discord's DAVE implementation parses user IDs as unsigned integer
+    /// Snowflakes. Reject malformed input before it reaches the native layer,
+    /// where it would otherwise surface only as an opaque parsing failure.
+    private func validateDiscordUserId(_ userId: String) throws {
+        guard !userId.isEmpty,
+              userId.utf8.count <= 20,
+              userId.unicodeScalars.allSatisfy({ (48...57).contains($0.value) }),
+              let value = UInt64(userId),
+              value > 0 else {
+            throw DaveError.invalidDiscordUserId(userId)
+        }
+    }
+
+    private func ensureAcceptingGatewayEvents() throws {
+        guard handshakeState != .failed else {
+            throw DaveError.sessionFailed
+        }
+    }
+
+    private func validateDiscordUserIds(_ userIds: [String]) throws {
+        try validateRosterCount(userIds.count)
+        for userId in userIds {
+            try validateDiscordUserId(userId)
+        }
+    }
+
+    private func validateDiscordGroupId(_ groupId: UInt64) throws {
+        guard groupId > 0 else {
+            throw DaveError.invalidDiscordGroupId(groupId)
+        }
+    }
+
+    private func validateProtocolVersion(_ version: UInt16) throws {
+        let maximumSupported = daveMaxSupportedProtocolVersion()
+        guard version > 0, version <= maximumSupported else {
+            throw DaveError.unsupportedProtocolVersion(
+                requested: version,
+                maximumSupported: maximumSupported
+            )
+        }
+    }
+
+    private func validateMlsPayload(_ payload: Data, kind: String) throws {
+        guard payload.count <= limits.maximumMlsPayloadBytes else {
+            throw DaveError.payloadTooLarge(
+                kind: kind,
+                maximum: limits.maximumMlsPayloadBytes,
+                actual: payload.count
+            )
+        }
+    }
+
+    private func validateRosterCount(_ count: Int) throws {
+        guard count <= limits.maximumRosterMembers else {
+            throw DaveError.payloadTooLarge(
+                kind: "roster member count",
+                maximum: limits.maximumRosterMembers,
+                actual: count
+            )
+        }
+    }
+
+    private func handleProtocolVersionChanged(from generation: UInt64) {
+        guard generation == encryptorGeneration else { return }
+        guard let encryptor, encryptor.protocolVersion > 0 else { return }
+
+        // The version callback is a notification, not permission for native
+        // state to silently override the gateway-negotiated version. A stale
+        // encryptor callback or an unexpected downgrade must stop media.
+        let reported = encryptor.protocolVersion
+        let expected = pendingProtocolVersion ?? protocolVersion
+        guard reported == expected else {
+            failClosed(
+                reason: "Encryptor reported protocol version \(reported), expected \(expected)"
+            )
+            return
         }
         lastTransitionTimestamp = Date()
     }

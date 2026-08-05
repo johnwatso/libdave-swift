@@ -146,9 +146,43 @@ public enum DaveRecoveryHint: String, Codable, Sendable, CustomStringConvertible
     }
 }
 
+/// Resource limits applied by ``DaveSessionCoordinator`` before untrusted
+/// gateway bytes are handed to the native MLS implementation.
+///
+/// The defaults are intentionally generous for Discord voice calls while still
+/// preventing a malformed gateway payload from turning into an unbounded
+/// allocation or native parse attempt. Hosts with a known smaller deployment
+/// may lower them further.
+public struct DaveCoordinatorLimits: Sendable, Equatable {
+    public var maximumMlsPayloadBytes: Int
+    public var maximumRosterMembers: Int
+    public var maximumMediaFrameBytes: Int
+    public var maximumTrackedTransitions: Int
+    public var maximumPendingOutboundActions: Int
+
+    public init(
+        maximumMlsPayloadBytes: Int = 1_048_576,
+        maximumRosterMembers: Int = 1_000,
+        maximumMediaFrameBytes: Int = 65_535,
+        maximumTrackedTransitions: Int = 64,
+        maximumPendingOutboundActions: Int = 64
+    ) {
+        self.maximumMlsPayloadBytes = max(1, maximumMlsPayloadBytes)
+        self.maximumRosterMembers = max(1, maximumRosterMembers)
+        self.maximumMediaFrameBytes = max(1, maximumMediaFrameBytes)
+        self.maximumTrackedTransitions = max(1, maximumTrackedTransitions)
+        self.maximumPendingOutboundActions = max(1, maximumPendingOutboundActions)
+    }
+
+    public static let `default` = DaveCoordinatorLimits()
+}
+
 /// Coarse lifecycle state for Discord's MLS external sender package.
 public enum DaveExternalSenderState: String, Codable, Sendable {
     case missing
+    /// Non-empty sender bytes were submitted to the current native session.
+    /// The bundled C API does not expose parse success, so this is not proof
+    /// that native MLS accepted the payload.
     case registered
 }
 
@@ -165,6 +199,12 @@ public enum DaveRecoveryAction: String, Codable, Sendable {
     case pauseMedia
     case resumeMedia
     case invalidTransitionRecovery
+    case stageTransition
+    case activateTransition
+    case prepareProtocolVersion
+    case queueOutboundAction
+    case acknowledgeOutboundAction
+    case failClosed
 }
 
 /// Outbound Discord DAVE action emitted by the high-level coordinator helpers.
@@ -177,6 +217,65 @@ public enum DiscordDaveOutboundAction: Sendable, Equatable {
     case transitionReady(UInt64)
     /// Send as voice gateway opcode 31 (`daveMlsInvalidCommitWelcome`).
     case invalidCommitWelcome(UInt64)
+}
+
+/// A gateway action kept in the coordinator's bounded outbox until the host
+/// acknowledges a successful WebSocket write. The identifier is stable across
+/// retries, so callers can resend the exact same bytes without re-running MLS.
+public struct DiscordDaveOutboundActionEnvelope: Sendable, Equatable, Identifiable {
+    public let id: UUID
+    public let action: DiscordDaveOutboundAction
+
+    public init(id: UUID = UUID(), action: DiscordDaveOutboundAction) {
+        self.id = id
+        self.action = action
+    }
+}
+
+/// A DAVE/MLS gateway event that can be consumed by the coordinator's safe
+/// state-machine entry point. Transport-only downgrade handling remains the
+/// voice client's responsibility because libdave does not own RTP transport
+/// encryption.
+public enum DiscordDaveGatewayEvent: Sendable, Equatable {
+    case externalSender(Data)
+    case proposals(Data, recognizedUserIds: [String])
+    case welcome(Data, transitionId: UInt64, recognizedUserIds: [String])
+    case commit(Data, transitionId: UInt64)
+    case executeTransition(UInt64)
+    /// Opcode 24's `transition_id` binds the prepared protocol context to the
+    /// later Execute Transition. It must never be inferred from the MLS epoch.
+    case prepareEpoch(protocolVersion: UInt16, epoch: UInt64, transitionId: UInt64)
+}
+
+/// Result of consuming a ``DiscordDaveGatewayEvent``. `pendingActions` remain
+/// available from ``DaveSessionCoordinator/pendingDiscordGatewayActions()``
+/// until each one is acknowledged after a successful gateway write.
+public struct DiscordDaveGatewayResult: Sendable {
+    public let pendingActions: [DiscordDaveOutboundActionEnvelope]
+    public let mediaReady: Bool
+    public let recoveryHint: DaveRecoveryHint
+    public let diagnostics: DaveDiagnostics
+
+    public init(
+        pendingActions: [DiscordDaveOutboundActionEnvelope],
+        mediaReady: Bool,
+        recoveryHint: DaveRecoveryHint,
+        diagnostics: DaveDiagnostics
+    ) {
+        self.pendingActions = pendingActions
+        self.mediaReady = mediaReady
+        self.recoveryHint = recoveryHint
+        self.diagnostics = diagnostics
+    }
+
+    public var needsRecovery: Bool {
+        switch recoveryHint {
+        case .none, .retryLater, .waitForExternalSender:
+            return false
+        case .sendInvalidCommitWelcome, .recreateSession, .fatal:
+            return true
+        }
+    }
 }
 
 /// Result from a high-level Discord DAVE state-machine step.
@@ -228,6 +327,18 @@ public enum DaveError: Error, LocalizedError, Sendable {
     case decryptionFailed(reason: DaveDecryptorResultCode)
     case bufferTooSmall
     case invalidState(message: String)
+    case mediaNotReady
+    case invalidExternalSender
+    case externalSenderRejected(reason: String)
+    case invalidDiscordUserId(String)
+    case invalidDiscordGroupId(UInt64)
+    case unsupportedProtocolVersion(requested: UInt16, maximumSupported: UInt16)
+    case externalSenderRequired
+    case externalSenderConflict
+    case transitionConflict(transitionId: UInt64)
+    case payloadTooLarge(kind: String, maximum: Int, actual: Int)
+    case invalidMediaFrameSize(actual: Int, maximum: Int)
+    case sessionFailed
     case notConfigured
 
     public var errorDescription: String? {
@@ -254,6 +365,30 @@ public enum DaveError: Error, LocalizedError, Sendable {
             return "The destination buffer capacity was insufficient."
         case .invalidState(let message):
             return "Invalid session state: \(message)"
+        case .mediaNotReady:
+            return "DAVE media is not ready. Wait for the matching Execute Transition signal before processing media."
+        case .invalidExternalSender:
+            return "Invalid external sender: the serialized payload must not be empty."
+        case .externalSenderRejected(let reason):
+            return "The native MLS implementation rejected the external sender: \(reason)"
+        case .invalidDiscordUserId(let userId):
+            return "Invalid Discord user ID: '\(userId)'. Expected a non-zero unsigned decimal Snowflake."
+        case .invalidDiscordGroupId(let groupId):
+            return "Invalid Discord group ID: '\(groupId)'. Expected a non-zero Guild Snowflake."
+        case .unsupportedProtocolVersion(let requested, let maximumSupported):
+            return "Unsupported DAVE protocol version \(requested). This library supports versions 1 through \(maximumSupported)."
+        case .externalSenderRequired:
+            return "A Discord MLS external sender package is required before publishing an initial key package."
+        case .externalSenderConflict:
+            return "Conflicting Discord MLS external sender packages were received for the same session."
+        case .transitionConflict(let transitionId):
+            return "Conflicting DAVE gateway payloads were received for transition \(transitionId)."
+        case .payloadTooLarge(let kind, let maximum, let actual):
+            return "DAVE \(kind) payload is too large (\(actual) bytes; maximum \(maximum))."
+        case .invalidMediaFrameSize(let actual, let maximum):
+            return "DAVE media frame is too large (\(actual) bytes; maximum \(maximum))."
+        case .sessionFailed:
+            return "The DAVE session has failed closed. Recreate it before accepting more gateway events."
         case .notConfigured:
             return "DAVE Session Coordinator is not configured. Please call configureForDiscordVoice first."
         }
@@ -291,6 +426,26 @@ public enum DaveError: Error, LocalizedError, Sendable {
             return .fatal
         case .invalidState:
             return .retryLater
+        case .mediaNotReady:
+            return .retryLater
+        case .invalidExternalSender:
+            return .waitForExternalSender
+        case .externalSenderRejected:
+            return .recreateSession
+        case .invalidDiscordUserId:
+            return .fatal
+        case .invalidDiscordGroupId, .unsupportedProtocolVersion:
+            return .fatal
+        case .externalSenderRequired:
+            return .waitForExternalSender
+        case .externalSenderConflict:
+            return .recreateSession
+        case .transitionConflict:
+            return .recreateSession
+        case .payloadTooLarge, .invalidMediaFrameSize:
+            return .fatal
+        case .sessionFailed:
+            return .recreateSession
         case .notConfigured:
             return .fatal
         }

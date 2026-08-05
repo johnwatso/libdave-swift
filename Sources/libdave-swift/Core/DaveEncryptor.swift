@@ -10,7 +10,17 @@ import CDave
 /// > across concurrency domains.
 public final class DaveEncryptor {
     internal let handle: DAVEEncryptorHandle
-    private var bridgePointer: UnsafeMutableRawPointer? = nil
+    /// A single stable callback context is used for the complete native
+    /// encryptor lifetime. Replacing the Swift closure never replaces the raw
+    /// pointer retained by native code, avoiding a stale-pointer race.
+    private let callbackBridge: DaveEncryptorCallbackBridge
+    private let bridgePointer: UnsafeMutableRawPointer
+    /// Set only after the native API receives `bridgePointer`; until then the
+    /// bridge is owned solely by this Swift encryptor and needs no tombstone.
+    private var callbackBridgeRetainedForNativeLifetime = false
+    // `daveEncryptorSetKeyRatchet` borrows this handle; it does not take
+    // ownership. Keep the Swift wrapper alive for every native encrypt call.
+    private var keyRatchet: DaveKeyRatchet?
     private let lock = NSLock()
 
     /// Creates a new media frame encryptor.
@@ -18,18 +28,32 @@ public final class DaveEncryptor {
         guard let handle = daveEncryptorCreate() else {
             throw DaveError.encryptorCreationFailed
         }
+
+        let bridge = DaveEncryptorCallbackBridge()
         self.handle = handle
+        self.callbackBridge = bridge
+        self.bridgePointer = Unmanaged.passUnretained(bridge).toOpaque()
     }
 
     deinit {
-        daveEncryptorDestroy(handle)
-        if let bridgePtr = bridgePointer {
-            Unmanaged<DaveEncryptorCallbackBridge>.fromOpaque(bridgePtr).release()
+        // Do this before native teardown: a callback emitted by destruction,
+        // or one already queued on another thread, becomes a harmless no-op.
+        callbackBridge.deactivate()
+        if callbackBridgeRetainedForNativeLifetime {
+            // The C API has no documented drain operation, but clearing the
+            // registration asks the current native implementation to stop
+            // future delivery before destruction. The tombstone remains for
+            // any callback that was already in flight.
+            daveEncryptorSetProtocolVersionChangedCallback(handle, nil, nil)
         }
+        daveEncryptorDestroy(handle)
     }
 
     /// Sets the key ratchet for encryption.
     public func setKeyRatchet(_ keyRatchet: DaveKeyRatchet) {
+        // Retain before crossing the native boundary so the handle remains
+        // valid even when the caller supplied a temporary local value.
+        self.keyRatchet = keyRatchet
         daveEncryptorSetKeyRatchet(handle, keyRatchet.handle)
     }
 
@@ -50,6 +74,9 @@ public final class DaveEncryptor {
 
     /// Calculates the maximum ciphertext size for a given plaintext frame size.
     public func maxCiphertextByteSize(mediaType: DaveMediaType, frameSize: Int) -> Int {
+        // The C API takes `size_t`; never allow a negative Swift `Int` to be
+        // reinterpreted as a huge unsigned allocation request.
+        guard frameSize >= 0 else { return 0 }
         return daveEncryptorGetMaxCiphertextByteSize(handle, mediaType.cValue, frameSize)
     }
 
@@ -104,22 +131,21 @@ public final class DaveEncryptor {
     /// Sets a callback to be notified when the protocol version changes.
     public func setProtocolVersionChangedCallback(_ callback: @escaping @Sendable () -> Void) {
         lock.lock()
-        defer { lock.unlock() }
-
-        if let oldBridgePtr = bridgePointer {
-            Unmanaged<DaveEncryptorCallbackBridge>.fromOpaque(oldBridgePtr).release()
+        if !callbackBridgeRetainedForNativeLifetime {
+            DaveNativeCallbackContextRetainer.shared.retainForNativeLifetime(callbackBridge)
+            callbackBridgeRetainedForNativeLifetime = true
         }
+        callbackBridge.onProtocolVersionChanged = callback
+        lock.unlock()
 
-        let bridge = DaveEncryptorCallbackBridge()
-        bridge.onProtocolVersionChanged = callback
-        let bridgePtr = Unmanaged.passRetained(bridge).toOpaque()
-
+        // The native setter may synchronously deliver the callback. Do not
+        // hold the wrapper lock across that call, or a client callback that
+        // updates its own registration could deadlock.
         daveEncryptorSetProtocolVersionChangedCallback(
             handle,
             daveEncryptorProtocolVersionChangedCallbackBridge,
-            bridgePtr
+            bridgePointer
         )
-        self.bridgePointer = bridgePtr
     }
 
     /// Gets encryption statistics for a given media type.

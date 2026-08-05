@@ -50,10 +50,10 @@ public final class DaveCommitResult: @unchecked Sendable {
         var rosterIdsPtr: UnsafeMutablePointer<UInt64>? = nil
         var length: Int = 0
         daveCommitResultGetRosterMemberIds(handle, &rosterIdsPtr, &length)
-        guard let ptr = rosterIdsPtr, length > 0 else { return [] }
-        let ids = Array(UnsafeBufferPointer(start: ptr, count: length))
-        daveFree(ptr)
-        return ids
+        guard let ptr = rosterIdsPtr else { return [] }
+        defer { daveFree(ptr) }
+        guard length > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: ptr, count: length))
     }
 
     /// Retrieves the signature of a roster member.
@@ -62,10 +62,10 @@ public final class DaveCommitResult: @unchecked Sendable {
         var signaturePtr: UnsafeMutablePointer<UInt8>? = nil
         var length: Int = 0
         daveCommitResultGetRosterMemberSignature(handle, rosterId, &signaturePtr, &length)
-        guard let ptr = signaturePtr, length > 0 else { return nil }
-        let data = Data(bytes: ptr, count: length)
-        daveFree(ptr)
-        return data
+        guard let ptr = signaturePtr else { return nil }
+        defer { daveFree(ptr) }
+        guard length > 0 else { return nil }
+        return Data(bytes: ptr, count: length)
     }
 }
 
@@ -86,10 +86,10 @@ public final class DaveWelcomeResult: @unchecked Sendable {
         var rosterIdsPtr: UnsafeMutablePointer<UInt64>? = nil
         var length: Int = 0
         daveWelcomeResultGetRosterMemberIds(handle, &rosterIdsPtr, &length)
-        guard let ptr = rosterIdsPtr, length > 0 else { return [] }
-        let ids = Array(UnsafeBufferPointer(start: ptr, count: length))
-        daveFree(ptr)
-        return ids
+        guard let ptr = rosterIdsPtr else { return [] }
+        defer { daveFree(ptr) }
+        guard length > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: ptr, count: length))
     }
 
     /// Retrieves the signature of a roster member from this welcome message.
@@ -97,10 +97,10 @@ public final class DaveWelcomeResult: @unchecked Sendable {
         var signaturePtr: UnsafeMutablePointer<UInt8>? = nil
         var length: Int = 0
         daveWelcomeResultGetRosterMemberSignature(handle, rosterId, &signaturePtr, &length)
-        guard let ptr = signaturePtr, length > 0 else { return nil }
-        let data = Data(bytes: ptr, count: length)
-        daveFree(ptr)
-        return data
+        guard let ptr = signaturePtr else { return nil }
+        defer { daveFree(ptr) }
+        guard length > 0 else { return nil }
+        return Data(bytes: ptr, count: length)
     }
 }
 
@@ -114,7 +114,7 @@ public final class DaveWelcomeResult: @unchecked Sendable {
 /// > to share it across concurrency domains.
 public final class DaveSession {
     internal let handle: DAVESessionHandle
-    private let bridgePointer: UnsafeMutableRawPointer
+    private let callbackBridge: DaveSessionCallbackBridge
 
     /// Returns the maximum protocol version supported by this library.
     public static var maxSupportedProtocolVersion: UInt16 {
@@ -128,26 +128,37 @@ public final class DaveSession {
     public init(authSessionId: String? = nil, onMLSFailure: @escaping @Sendable (String, String) -> Void) throws {
         let bridge = DaveSessionCallbackBridge()
         bridge.onMLSFailure = onMLSFailure
-        let bridgePtr = Unmanaged.passRetained(bridge).toOpaque()
+        // Keep the raw callback context valid even if the native library
+        // delivers a callback after session destruction. `deactivate()` in
+        // `deinit` drops the user closure so the retained shell is inert.
+        DaveNativeCallbackContextRetainer.shared.retainForNativeLifetime(bridge)
+        let bridgePtr = Unmanaged.passUnretained(bridge).toOpaque()
 
         let authIdCString = authSessionId?.cString(using: .utf8)
         let handleOpt = daveSessionCreate(nil, authIdCString, daveMLSFailureCallbackBridge, bridgePtr)
 
         guard let handle = handleOpt else {
-            Unmanaged<DaveSessionCallbackBridge>.fromOpaque(bridgePtr).release()
+            bridge.deactivate()
             throw DaveError.sessionCreationFailed
         }
 
         self.handle = handle
-        self.bridgePointer = bridgePtr
+        self.callbackBridge = bridge
     }
 
     deinit {
+        // The native C API has no documented callback drain. Deactivate first
+        // so any callback concurrent with or following destruction is inert;
+        // the bridge remains retained by DaveNativeCallbackContextRetainer.
+        callbackBridge.deactivate()
         daveSessionDestroy(handle)
-        Unmanaged<DaveSessionCallbackBridge>.fromOpaque(bridgePointer).release()
     }
 
     /// Initializes a session with protocol version and group information.
+    ///
+    /// - Important: `selfUserId` must be a non-zero unsigned decimal Discord
+    ///   Snowflake. ``DaveSessionCoordinator`` validates this before calling
+    ///   the native implementation; low-level callers must do the same.
     public func initialize(version: UInt16, groupId: UInt64, selfUserId: String) {
         daveSessionInit(handle, version, groupId, selfUserId.cString(using: .utf8))
     }
@@ -161,8 +172,7 @@ public final class DaveSession {
     /// if one was reported since the last call. Useful for attaching the real
     /// native reason to an error thrown right after a transition call.
     public func takeLastMLSFailure() -> (source: String, reason: String)? {
-        let bridge = Unmanaged<DaveSessionCallbackBridge>.fromOpaque(bridgePointer).takeUnretainedValue()
-        return bridge.takeLastFailure()
+        callbackBridge.takeLastFailure()
     }
 
     /// Sets the protocol version for the session.
@@ -180,10 +190,10 @@ public final class DaveSession {
         var authPtr: UnsafeMutablePointer<UInt8>? = nil
         var length: Int = 0
         daveSessionGetLastEpochAuthenticator(handle, &authPtr, &length)
-        guard let ptr = authPtr, length > 0 else { return nil }
-        let data = Data(bytes: ptr, count: length)
-        daveFree(ptr)
-        return data
+        guard let ptr = authPtr else { return nil }
+        defer { daveFree(ptr) }
+        guard length > 0 else { return nil }
+        return Data(bytes: ptr, count: length)
     }
 
     /// Sets the external sender credentials.
@@ -223,10 +233,10 @@ public final class DaveSession {
             }
         }
 
-        guard let ptr = outputPtr, outputLength > 0 else { return nil }
-        let data = Data(bytes: ptr, count: outputLength)
-        daveFree(ptr)
-        return data
+        guard let ptr = outputPtr else { return nil }
+        defer { daveFree(ptr) }
+        guard outputLength > 0 else { return nil }
+        return Data(bytes: ptr, count: outputLength)
     }
 
     /// Processes an incoming MLS commit message.
@@ -270,10 +280,10 @@ public final class DaveSession {
         var outputPtr: UnsafeMutablePointer<UInt8>? = nil
         var outputLength: Int = 0
         daveSessionGetMarshalledKeyPackage(handle, &outputPtr, &outputLength)
-        guard let ptr = outputPtr, outputLength > 0 else { return nil }
-        let data = Data(bytes: ptr, count: outputLength)
-        daveFree(ptr)
-        return data
+        guard let ptr = outputPtr else { return nil }
+        defer { daveFree(ptr) }
+        guard outputLength > 0 else { return nil }
+        return Data(bytes: ptr, count: outputLength)
     }
 
     /// Gets a key ratchet for a specific user.
@@ -287,20 +297,21 @@ public final class DaveSession {
     /// The callback receives `nil` if the native library produced no fingerprint,
     /// so an awaiting caller can always resume rather than hang indefinitely.
     ///
-    /// The native library invokes the callback exactly once, synchronously,
-    /// before `daveSessionGetPairwiseFingerprint` returns. The per-call bridge
-    /// is retained until that invocation, so a native implementation that never
-    /// called back would leak the closure — the current implementation always
-    /// calls back.
+    /// The bundled native implementation invokes the callback synchronously.
+    /// The bridge nevertheless remains valid for process lifetime because the
+    /// C API does not document callback drain semantics; a late or duplicate
+    /// callback is safely ignored after the first delivery.
     public func getPairwiseFingerprint(
         version: UInt16,
         userId: String,
         callback: @escaping @Sendable (Data?) -> Void
     ) {
         // Dedicated per-call bridge: concurrent requests cannot clobber one
-        // another's closure. The router consumes it via takeRetainedValue.
+        // another's closure. Keep its raw callback context valid even if the
+        // native implementation ever changes its callback timing.
         let bridge = DaveFingerprintCallbackBridge(callback: callback)
-        let bridgePtr = Unmanaged.passRetained(bridge).toOpaque()
+        DaveNativeCallbackContextRetainer.shared.retainForNativeLifetime(bridge)
+        let bridgePtr = Unmanaged.passUnretained(bridge).toOpaque()
         userId.withCString { userIdPtr in
             daveSessionGetPairwiseFingerprint(
                 handle,

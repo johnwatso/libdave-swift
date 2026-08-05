@@ -24,7 +24,7 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 
 ## Features
 
-* **Self-Contained Integration:** All C++ core logic, Cisco's MLS library (`mlspp`), and OpenSSL 3.0 are statically precompiled into a unified `Dave.xcframework`. No external build tools (like CMake or vcpkg) are required by client applications.
+* **Self-Contained Integration:** The bundled `Dave.xcframework` contains the native DAVE/MLS/libcrypto implementation, so client applications need no CMake or vcpkg installation. Its checksum-backed, evidence-limited component inventory is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 * **Type-Safe Swift Interfaces:** Raw C pointers and manual allocations are mapped behind standard Swift classes (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`).
 * **High-Level Coordinator:** `DaveSessionCoordinator` is an `actor` that orchestrates the session, key ratchets, and media crypto behind one async API, exposing handshake state and `DaveDiagnostics`.
 * **Persistent Signature Identity:** Passing an `authSessionId` gives the session a persisted MLS signature key pair (stored under `$XDG_CONFIG_HOME`/`~/.config` in `Discord Key Storage/`), so the client keeps a stable identity across reconnects — matching official Discord clients. Passing `nil` uses a fresh ephemeral identity per session.
@@ -40,13 +40,16 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 
 ## Installation
 
-**Requirements:** macOS 26+ (the bundled `Dave.xcframework` is built with a macOS 26 deployment target).
+> [!IMPORTANT]
+> **Apple Silicon only.** The bundled framework has one `macos-arm64` slice: use it on Apple Silicon Macs running macOS 26 or later. Intel Macs and x86_64 Rosetta targets are unsupported.
+
+**Requirements:** macOS 26+ on Apple Silicon (the bundled `Dave.xcframework` is built with a macOS 26 deployment target).
 
 Add the dependency to your project in Xcode, or append it to your `Package.swift` manifest. Pinning to a tagged release is recommended:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/johnwatso/libdave-swift.git", from: "1.3.1")
+    .package(url: "https://github.com/johnwatso/libdave-swift.git", exact: "2.0.0")
 ]
 ```
 
@@ -61,125 +64,77 @@ Then add the product target `libdave-swift` as a dependency in your application:
 )
 ```
 
+The package version is the plain SemVer Git tag (for example, `2.0.0`), not a
+field inside `Package.swift`. For production deployments, pin a verified tag;
+see [CHANGELOG.md](CHANGELOG.md) for behavior changes and
+[Docs/MIGRATING_TO_2.0.md](Docs/MIGRATING_TO_2.0.md) for the 2.0 integration
+contract, and [Docs/RELEASING.md](Docs/RELEASING.md) for release verification.
+
 ---
 
-## Quick Start Guide
+## Quick Start: Coordinator-First
 
-The example below uses the low-level wrappers to show the raw session/encrypt/decrypt flow. For application integration, prefer the high-level `DaveSessionCoordinator`, which manages session lifecycle, ratchet transitions, and diagnostics behind one async API.
+Use `DaveSessionCoordinator` for Discord Voice. The outline below deliberately has no made-up payloads: MLS external-sender, welcome, commit, and proposal bytes must come from the real Discord Voice gateway, and every user ID must be a non-zero decimal Discord Snowflake. It is an integration shape, not a standalone encryption demo.
 
 ```swift
 import Foundation
 import libdave_swift
 
-do {
-    // 1. Initialize a secure DAVE Session
-    let session = try DaveSession { source, reason in
-        print("MLS failure in \(source): \(reason)")
-    }
-    
-    // Initialize the session with version, group ID, and local user ID
-    session.initialize(version: 1, groupId: 998877, selfUserId: "swiftbot-client")
-    print("Session initialized. Protocol version: \(session.protocolVersion)")
+let coordinator = DaveSessionCoordinator(authSessionId: persistentSessionID)
 
-    // 2. Create a Media Frame Encryptor
-    let encryptor = try DaveEncryptor()
-    
-    // Assign synchronization source (SSRC) to standard Opus audio codec
-    let audioSsrc: UInt32 = 112233
-    encryptor.assignSsrcToCodec(ssrc: audioSsrc, codec: .opus)
-
-    // Retrieve the user's key ratchet and set it on the encryptor
-    if let keyRatchet = session.getKeyRatchet(userId: "swiftbot-client") {
-        encryptor.setKeyRatchet(keyRatchet)
-    }
-
-    // 3. Encrypt an Audio Frame
-    let rawAudioFrame = Data([0x01, 0x02, 0x03, 0x04])
-    
-    let encryptedFrame = try encryptor.encrypt(
-        mediaType: .audio,
-        ssrc: audioSsrc,
-        frame: rawAudioFrame
-    )
-    print("Encrypted \(rawAudioFrame.count) bytes into \(encryptedFrame.count) bytes")
-
-    // 4. Create a Media Frame Decryptor
-    let decryptor = try DaveDecryptor()
-    
-    if let receiverRatchet = session.getKeyRatchet(userId: "swiftbot-client") {
-        decryptor.transitionToKeyRatchet(receiverRatchet)
-    }
-
-    // Decrypt the payload back to plaintext
-    let decryptedFrame = try decryptor.decrypt(
-        mediaType: .audio,
-        encryptedFrame: encryptedFrame
-    )
-    print("Decrypted payload: \(decryptedFrame.map { String(format: "%02hhx", $0) }.joined())")
-
-} catch {
-    print("DAVE Protocol Error: \(error.localizedDescription)")
-}
-```
-
----
-
-## Discord Voice Coordinator Flow
-
-Most Discord clients should use `DaveSessionCoordinator` and send the emitted `DiscordDaveOutboundAction` values through their voice gateway layer. The coordinator keeps track of one-time key-package publishing, cached external sender state, pending media readiness, and invalid-transition recovery.
-
-```swift
-let coordinator = DaveSessionCoordinator()
-
-try await coordinator.configureDiscordVoiceSession(
-    groupId: guildId,
-    selfUserId: userId,
+// `guildID`, `selfUserID`, and `daveVersion` are supplied by your Discord
+// Voice session. `selfUserID` is a decimal Snowflake string.
+let configured = try await coordinator.configureDiscordVoiceSession(
+    groupId: guildID,
+    selfUserId: selfUserID,
     protocolVersion: daveVersion
 )
+try await sendToVoiceGateway(configured.outboundActions)
 
-let registered = try await coordinator.registerDiscordExternalSender(externalSender)
-for action in registered.outboundActions {
-    switch action {
-    case .mlsKeyPackage(let data):
-        try await gateway.sendMlsKeyPackage(data)
-    case .mlsCommitWelcome(let data):
-        try await gateway.sendMlsCommitWelcome(data)
-    case .transitionReady(let transitionId):
-        try await gateway.sendTransitionReady(transitionId: transitionId)
-    case .invalidCommitWelcome(let transitionId):
-        try await gateway.sendInvalidCommitWelcome(transitionId: transitionId)
+// Use the replay-safe gateway-event API. Its action envelopes stay pending
+// until the WebSocket write succeeds and each one is acknowledged.
+func deliver(_ result: DiscordDaveGatewayResult) async throws {
+    for envelope in result.pendingActions {
+        try await sendToVoiceGateway(envelope.action)
+        await coordinator.acknowledgeDiscordGatewayAction(envelope.id)
     }
 }
-```
 
-When Discord announces a commit or welcome, the high-level helpers return either `.transitionReady(...)` or the ordered recovery actions needed after an invalid commit/welcome:
-
-```swift
-let result = try await coordinator.processDiscordCommitForOutbound(
-    commitBytes,
-    transitionId: transitionId
+// Supply the serialized external sender exactly as received from Discord.
+// This queues the initial key package; there is no safe fallback before it.
+let registered = try await coordinator.consumeDiscordGatewayEvent(
+    .externalSender(externalSenderBytes)
 )
+try await deliver(registered)
 
-if result.needsRecovery {
-    print("DAVE recovery hint: \(result.recoveryHint)")
-}
+// On a gateway Welcome, pass the serialized Welcome and its numeric roster IDs.
+let transition = try await coordinator.consumeDiscordGatewayEvent(
+    .welcome(
+        welcomeBytes,
+        transitionId: transitionID,
+        recognizedUserIds: rosterSnowflakeIDs
+    )
+)
+try await deliver(transition) // sends Transition Ready or recovery actions
+
+// Wait for Discord's matching Execute Transition event. Do not process media first.
+let executed = try await coordinator.consumeDiscordGatewayEvent(
+    .executeTransition(transitionID)
+)
+try await deliver(executed)
+guard executed.mediaReady else { throw DaveError.mediaNotReady }
+
+// Only now: encrypt outbound Opus before RTP packetization, and decrypt inbound payloads.
+let ciphertext = try await coordinator.encryptDiscordAudioFrame(opusFrame, ssrc: audioSSRC)
+let plaintext = try await coordinator.decryptDiscordAudioFrame(incomingEncryptedPayload, from: remoteSnowflakeID)
 ```
 
-Once media is ready, both directions of the voice path go through the coordinator:
+`sendToVoiceGateway(_:)` is your adapter for `DiscordDaveOutboundAction`: map `.mlsKeyPackage`, `.mlsCommitWelcome`, `.transitionReady`, and `.invalidCommitWelcome` to the corresponding Voice gateway opcodes. On a failed write, do **not** acknowledge the envelope: ask `pendingDiscordGatewayActions()` for the same ordered bytes after reconnect. Commits and epoch preparation use the same `consumeDiscordGatewayEvent(_:)` flow. Handle `result.recoveryHint` and `result.needsRecovery`; the coordinator returns the ordered invalid-transition recovery actions when applicable.
 
-```swift
-// Outbound: encrypt your Opus frames before RTP packetization
-let ciphertext = try await coordinator.encryptDiscordAudioFrame(opusFrame, ssrc: audioSsrc)
+The coordinator rejects media before the matching Execute Transition by throwing `DaveError.mediaNotReady`. If a frame races a later MLS transition, treat its `.retryLater` recovery hint as a drop-and-continue condition. For an established group, send Discord's Prepare Epoch as `.prepareEpoch(protocolVersion:epoch:transitionId:)`; deliver its `.transitionReady(transitionID)` action, then wait for the matching `.executeTransition(transitionID)` before outbound media switches to the staged epoch.
 
-// Inbound: decrypt each remote speaker's frames by Discord user ID.
-// Decryptors are created lazily per speaker and re-keyed automatically
-// after every MLS welcome/commit.
-let plaintext = try await coordinator.decryptDiscordAudioFrame(payload, from: senderUserId)
-```
-
-If a frame races an MLS transition, `decryptDiscordAudioFrame` throws `DaveError.decryptionFailed(reason: .missingKeyRatchet)` whose `recoveryHint` is `.retryLater` — drop the frame and continue.
-
-For established sessions, call `prepareDiscordEpoch(protocolVersion:epoch:)` when Discord prepares a fresh epoch and `executeDiscordTransition(_:)` when Discord later confirms execution. The coordinator-owned media readiness watchdog can be queried with `evaluateMediaReadinessWatchdog()` if the host wants to fail or reconnect a session that never becomes ready again. Identity verification is available via `pairwiseFingerprint(version:userId:)`.
+> [!WARNING]
+> The C setter for an external sender returns `void`, but the coordinator drains a native failure reported synchronously through its callback and throws `DaveError.externalSenderRejected` before it can issue a key package. A later native failure still fails the session closed. Successful registration is not a substitute for a genuine end-to-end MLS fixture; see the [MLS integration fixture contract](Docs/MLS_INTEGRATION_FIXTURES.md).
 
 ---
 

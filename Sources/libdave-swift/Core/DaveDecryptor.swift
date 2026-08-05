@@ -10,6 +10,9 @@ import CDave
 /// > across concurrency domains.
 public final class DaveDecryptor {
     internal let handle: DAVEDecryptorHandle
+    // `daveDecryptorTransitionToKeyRatchet` borrows this handle; it does not
+    // take ownership. Retain the wrapper for the lifetime of the assignment.
+    private var keyRatchet: DaveKeyRatchet?
 
     /// Creates a new media frame decryptor.
     public init() throws {
@@ -25,6 +28,7 @@ public final class DaveDecryptor {
 
     /// Transitions the decryptor to use a new key ratchet.
     public func transitionToKeyRatchet(_ keyRatchet: DaveKeyRatchet) {
+        self.keyRatchet = keyRatchet
         daveDecryptorTransitionToKeyRatchet(handle, keyRatchet.handle)
     }
 
@@ -35,6 +39,9 @@ public final class DaveDecryptor {
 
     /// Calculates the maximum plaintext size for a given ciphertext frame size.
     public func maxPlaintextByteSize(mediaType: DaveMediaType, encryptedFrameSize: Int) -> Int {
+        // The C API takes `size_t`; never allow a negative Swift `Int` to be
+        // reinterpreted as a huge unsigned allocation request.
+        guard encryptedFrameSize >= 0 else { return 0 }
         return daveDecryptorGetMaxPlaintextByteSize(handle, mediaType.cValue, encryptedFrameSize)
     }
 

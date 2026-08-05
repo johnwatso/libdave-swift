@@ -2,20 +2,19 @@
   {
     "event": "configure",
     "groupId": 667788,
-    "selfUserId": "user-667788",
+    "selfUserId": "667788",
     "protocolVersion": 1
   },
   {
     "event": "externalSender",
-    "externalSenderHex": "0102030405"
+    "externalSenderHex": "0102030405",
+    "expectedError": "externalSenderRejected"
   },
   {
     "event": "prepareEpoch",
     "protocolVersion": 1,
-    "epoch": 2
-  },
-  {
-    "event": "invalidTransition",
-    "transitionId": 99
+    "epoch": 2,
+    "transitionId": 98,
+    "expectedError": "sessionFailed"
   }
 ]
