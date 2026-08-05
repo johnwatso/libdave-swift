@@ -4,6 +4,15 @@ All notable changes to `libdave-swift` are documented here. The version is the
 SemVer Git tag (for example, `1.3.1`); `Package.swift` intentionally does not
 carry a second, independently mutable version number.
 
+## [2.0.1] - 2026-08-05
+
+### Fixed
+
+- Correctly handle Discord's epoch-1 sole-member reset: Execute Transition
+  `0` now executes immediately without sending Transition Ready, clears the
+  ordinary transition watchdog, and keeps media fail-closed until a real MLS
+  Commit or Welcome establishes a usable ratchet.
+
 ## [2.0.0] - 2026-08-05
 
 ### Release recommendation

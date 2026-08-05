@@ -118,6 +118,13 @@ public actor DaveSessionCoordinator {
     private var mediaReadinessWatchdogTimeout: TimeInterval = 10
     private var mediaReadinessWatchdogReason: String?
     private var mediaReadinessWatchdogTask: Task<Void, Never>?
+    /// Opcode 21 with transition ID zero is Discord's sole-member-reset
+    /// signal. It immediately executes the new *pending* local group, which
+    /// is intentionally not media-ready until native MLS later establishes a
+    /// group through a real Commit or Welcome. Keep this fact separately from
+    /// staged ratchets: there is no ratchet to stage yet, and leaving an empty
+    /// staged transition behind would poison the next real transition ID.
+    private var soleMemberResetExecuteSeen = false
 
     /// Creates a new coordinator.
     /// - Parameter authSessionId: Optional identifier for managing persistent key lifetimes.
@@ -197,6 +204,7 @@ public actor DaveSessionCoordinator {
         lastRecoveryAction = .reset
         hasIssuedInitialKeyPackage = false
         hasSentInitialKeyPackage = false
+        soleMemberResetExecuteSeen = false
         clearMediaReadinessWatchdog()
     }
 
@@ -355,7 +363,13 @@ public actor DaveSessionCoordinator {
                     source: .welcome,
                     protocolVersion: pendingProtocolVersion ?? protocolVersion
                 )
-                if executeAlreadySeen {
+                // Initialization transitions use ID zero. Discord does not
+                // send Transition Ready/Execute around their Commit/Welcome;
+                // native MLS has already supplied the ratchet, so activate it
+                // immediately. Later nonzero transitions remain Execute-gated.
+                if transitionId == 0 {
+                    activateStagedTransition(transitionId, reason: "initialization welcome")
+                } else if executeAlreadySeen {
                     activateStagedTransition(transitionId, reason: "Execute arrived before welcome")
                 } else if activeOutboundRatchet == nil {
                     beginMediaReadinessWait(
@@ -364,7 +378,10 @@ public actor DaveSessionCoordinator {
                     )
                 }
             }
-            let result = makeDiscordResult(actions: [.transitionReady(transitionId)])
+            // Transition ID zero is the sole-member-reset initialization
+            // signal. It executes immediately and must not emit Opcode 23.
+            let actions: [DiscordDaveOutboundAction] = transitionId == 0 ? [] : [.transitionReady(transitionId)]
+            let result = makeDiscordResult(actions: actions)
             storeTransitionResult(
                 kind: .welcome,
                 transitionId: transitionId,
@@ -413,7 +430,12 @@ public actor DaveSessionCoordinator {
                     source: .commit,
                     protocolVersion: pendingProtocolVersion ?? protocolVersion
                 )
-                if executeAlreadySeen {
+                // See the Welcome path: a Commit carrying initialization ID
+                // zero establishes its returned ratchet immediately; ordinary
+                // transitions stay staged until their matching Execute.
+                if transitionId == 0 {
+                    activateStagedTransition(transitionId, reason: "initialization commit")
+                } else if executeAlreadySeen {
                     activateStagedTransition(transitionId, reason: "Execute arrived before commit")
                 } else if activeOutboundRatchet == nil {
                     beginMediaReadinessWait(
@@ -422,7 +444,10 @@ public actor DaveSessionCoordinator {
                     )
                 }
             }
-            let result = makeDiscordResult(actions: [.transitionReady(transitionId)])
+            // See the corresponding Welcome path: initialization transition
+            // zero is immediately executable and has no ready acknowledgement.
+            let actions: [DiscordDaveOutboundAction] = transitionId == 0 ? [] : [.transitionReady(transitionId)]
+            let result = makeDiscordResult(actions: actions)
             storeTransitionResult(
                 kind: .commit,
                 transitionId: transitionId,
@@ -448,6 +473,16 @@ public actor DaveSessionCoordinator {
         }
         if let cached = cachedTransitionResult(kind: .execute, transitionId: transitionId, payload: nil) {
             return cached
+        }
+
+        // Discord's sole-member reset is sent as Opcode 24 (epoch 1), followed
+        // by Opcode 21 with transition ID zero. Unlike normal transitions, it
+        // is executed immediately and has no following Opcode 22. Native
+        // libdave represents the fresh local group as pending, so it cannot
+        // produce a ratchet yet; preserve the executed state and remain
+        // fail-closed until a real Commit/Welcome establishes one.
+        if transitionId == 0, (pendingEpoch == 1 || soleMemberResetExecuteSeen) {
+            return executeDiscordSoleMemberReset()
         }
 
         // A repeated Execute for the currently active context is a benign
@@ -489,6 +524,63 @@ public actor DaveSessionCoordinator {
         storeTransitionResult(
             kind: .execute,
             transitionId: transitionId,
+            payload: nil,
+            actions: result.outboundActions,
+            recoveryHint: result.recoveryHint
+        )
+        return result
+    }
+
+    /// Executes Discord's special sole-member-reset initialization transition.
+    ///
+    /// Discord sends this as Opcode 21 with transition ID `0` immediately after
+    /// an epoch-1 reset. The native session deliberately keeps the fresh local
+    /// group pending until a later Commit or Welcome establishes it, so there
+    /// is no ratchet to activate here. This method records the authorization,
+    /// clears the ordinary ten-second transition watchdog, and keeps media
+    /// fail-closed rather than mistaking a pending local group for one that can
+    /// encrypt media.
+    private func executeDiscordSoleMemberReset() -> DiscordDaveTransitionResult {
+        if let cached = cachedTransitionResult(kind: .execute, transitionId: 0, payload: nil) {
+            return cached
+        }
+
+        guard pendingEpoch == 1 || soleMemberResetExecuteSeen else {
+            // The sentinel is only valid for initialization. Treat an isolated
+            // ID-zero Execute exactly like other out-of-order gateway events.
+            stageExecuteBeforeMls(0)
+            if activeOutboundRatchet == nil {
+                beginMediaReadinessWait(reason: "Execute Transition 0 arrived before MLS was ready")
+            }
+            let result = makeDiscordResult(recoveryHint: .retryLater)
+            storeTransitionResult(
+                kind: .execute,
+                transitionId: 0,
+                payload: nil,
+                actions: result.outboundActions,
+                recoveryHint: result.recoveryHint
+            )
+            return result
+        }
+
+        soleMemberResetExecuteSeen = true
+        mediaReady = false
+        // The Epoch-1 Prepare transition is now semantically executed. It is
+        // not an MLS readiness deadline: a solo client can legitimately remain
+        // pending until another member joins and produces the first commit.
+        pendingEpoch = nil
+        pendingTransitionId = nil
+        pendingProtocolVersion = nil
+        clearMediaReadinessWatchdog()
+        // Keep this patch release source-compatible: the existing pause-media
+        // diagnostic already describes the only safe outcome here.
+        lastRecoveryAction = .pauseMedia
+        lastTransitionTimestamp = Date()
+
+        let result = makeDiscordResult()
+        storeTransitionResult(
+            kind: .execute,
+            transitionId: 0,
             payload: nil,
             actions: result.outboundActions,
             recoveryHint: result.recoveryHint
@@ -1171,6 +1263,13 @@ public actor DaveSessionCoordinator {
         encryptor.setKeyRatchet(ratchet)
         activeOutboundRatchet = ratchet
         activeTransitionId = transitionId
+        // A later MLS Commit/Welcome with initialization ID zero consumes the
+        // sole-member-reset authorization immediately. Once it has installed
+        // a ratchet, a future replay must be handled by the ordinary active
+        // transition/ledger checks rather than revoking this live context.
+        if transitionId == 0 {
+            soleMemberResetExecuteSeen = false
+        }
         protocolVersion = staged.protocolVersion
         if pendingProtocolVersion == staged.protocolVersion {
             pendingProtocolVersion = nil

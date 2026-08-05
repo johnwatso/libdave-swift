@@ -1,7 +1,7 @@
 # Migrating to libdave-swift 2.0
 
 Version 2.0 makes the safe Discord DAVE flow explicit. Upgrade it before
-updating SwiftBot: resolve the immutable `2.0.0` package tag, run the bot's
+updating SwiftBot: resolve the latest immutable `2.0.x` package tag, run the bot's
 Voice integration tests, then deploy the SwiftBot change separately.
 
 ## What changed
@@ -75,6 +75,13 @@ outbound ratchet remains in service. Only the matching Execute Transition
 activates the staged outbound ratchet. Do not pause a working announcer solely
 because Prepare Epoch arrived, and do not switch its media to the new epoch
 until Execute has been consumed.
+
+For Discord's epoch-1 sole-member reset, the gateway instead sends Execute
+Transition `0` immediately after Prepare Epoch. Consume it immediately and do
+not send Transition Ready for ID `0`. Native MLS deliberately leaves the
+fresh local group pending, so media must remain paused until a later genuine
+Commit or Welcome establishes a ratchet; this state has no normal ten-second
+transition deadline.
 
 ## Announcer playback rules
 

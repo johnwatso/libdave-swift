@@ -514,6 +514,55 @@ final class libdaveSwiftTests: XCTestCase {
         }
     }
 
+    /// Discord's sole-member reset is an immediate initialization transition,
+    /// not a normal transition-ready/execute exchange. Native libdave correctly
+    /// keeps the local group pending until a real Commit or Welcome establishes
+    /// a ratchet, so the coordinator must clear the ordinary transition timeout
+    /// without ever letting plaintext/passthrough media through.
+    func testSoleMemberResetClearsWatchdogAndKeepsMediaFailClosed() async throws {
+        let coordinator = DaveSessionCoordinator()
+        try await coordinator.configureForDiscordVoice(groupId: 3458, selfUserId: "3458", protocolVersion: 1)
+        try await coordinator.setPassthroughMode(true)
+
+        let prepared = try await coordinator.consumeDiscordGatewayEvent(
+            .prepareEpoch(protocolVersion: 1, epoch: 1, transitionId: 91)
+        )
+        XCTAssertFalse(prepared.mediaReady)
+        XCTAssertEqual(prepared.diagnostics.pendingEpoch, 1)
+        XCTAssertEqual(prepared.diagnostics.pendingTransitionId, 91)
+
+        // Op21 transition ID zero immediately executes the reset; there is no
+        // Opcode 23 acknowledgement and no later Opcode 22 to wait for.
+        let reset = try await coordinator.consumeDiscordGatewayEvent(.executeTransition(0))
+        XCTAssertTrue(reset.pendingActions.isEmpty)
+        XCTAssertFalse(reset.mediaReady)
+        XCTAssertNil(reset.diagnostics.pendingEpoch)
+        XCTAssertNil(reset.diagnostics.pendingTransitionId)
+        XCTAssertEqual(reset.diagnostics.lastRecoveryAction, .pauseMedia)
+        let watchdog = await coordinator.evaluateMediaReadinessWatchdog(now: Date().addingTimeInterval(60))
+        XCTAssertEqual(
+            watchdog,
+            .inactive,
+            "a solo client may wait indefinitely for a later real MLS group without tripping a normal transition timeout"
+        )
+
+        do {
+            _ = try await coordinator.encryptDiscordAudioFrame(Data([0x05]), ssrc: 91)
+            XCTFail("a pending local group must not be treated as media-ready")
+        } catch let error as DaveError {
+            guard case .mediaNotReady = error else {
+                return XCTFail("Expected .mediaNotReady, got: \(error)")
+            }
+        }
+
+        // Gateway resume may replay this signal. It stays idempotent and does
+        // not recreate an MLS group or manufacture a ready acknowledgement.
+        let replay = try await coordinator.consumeDiscordGatewayEvent(.executeTransition(0))
+        XCTAssertTrue(replay.pendingActions.isEmpty)
+        XCTAssertFalse(replay.mediaReady)
+        XCTAssertEqual(replay.diagnostics.lastRecoveryAction, .pauseMedia)
+    }
+
     // MARK: - Inbound media (decrypt path)
 
     // A true encrypted round-trip cannot run in unit tests: the native library

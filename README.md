@@ -49,7 +49,7 @@ Add the dependency to your project in Xcode, or append it to your `Package.swift
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/johnwatso/libdave-swift.git", exact: "2.0.0")
+    .package(url: "https://github.com/johnwatso/libdave-swift.git", exact: "2.0.1")
 ]
 ```
 
@@ -64,7 +64,7 @@ Then add the product target `libdave-swift` as a dependency in your application:
 )
 ```
 
-The package version is the plain SemVer Git tag (for example, `2.0.0`), not a
+The package version is the plain SemVer Git tag (for example, `2.0.1`), not a
 field inside `Package.swift`. For production deployments, pin a verified tag;
 see [CHANGELOG.md](CHANGELOG.md) for behavior changes and
 [Docs/MIGRATING_TO_2.0.md](Docs/MIGRATING_TO_2.0.md) for the 2.0 integration
@@ -131,7 +131,7 @@ let plaintext = try await coordinator.decryptDiscordAudioFrame(incomingEncrypted
 
 `sendToVoiceGateway(_:)` is your adapter for `DiscordDaveOutboundAction`: map `.mlsKeyPackage`, `.mlsCommitWelcome`, `.transitionReady`, and `.invalidCommitWelcome` to the corresponding Voice gateway opcodes. On a failed write, do **not** acknowledge the envelope: ask `pendingDiscordGatewayActions()` for the same ordered bytes after reconnect. Commits and epoch preparation use the same `consumeDiscordGatewayEvent(_:)` flow. Handle `result.recoveryHint` and `result.needsRecovery`; the coordinator returns the ordered invalid-transition recovery actions when applicable.
 
-The coordinator rejects media before the matching Execute Transition by throwing `DaveError.mediaNotReady`. If a frame races a later MLS transition, treat its `.retryLater` recovery hint as a drop-and-continue condition. For an established group, send Discord's Prepare Epoch as `.prepareEpoch(protocolVersion:epoch:transitionId:)`; deliver its `.transitionReady(transitionID)` action, then wait for the matching `.executeTransition(transitionID)` before outbound media switches to the staged epoch.
+The coordinator rejects media before the matching Execute Transition by throwing `DaveError.mediaNotReady`. If a frame races a later MLS transition, treat its `.retryLater` recovery hint as a drop-and-continue condition. For an established group, send Discord's Prepare Epoch as `.prepareEpoch(protocolVersion:epoch:transitionId:)`; deliver its `.transitionReady(transitionID)` action, then wait for the matching `.executeTransition(transitionID)` before outbound media switches to the staged epoch. The epoch-1 sole-member reset is the exception: Discord follows it with `.executeTransition(0)` immediately, without a transition-ready acknowledgement. Consume it, but keep media paused—the native fresh local group has no usable ratchet until a later real Commit or Welcome arrives.
 
 > [!WARNING]
 > The C setter for an external sender returns `void`, but the coordinator drains a native failure reported synchronously through its callback and throws `DaveError.externalSenderRejected` before it can issue a key package. A later native failure still fails the session closed. Successful registration is not a substitute for a genuine end-to-end MLS fixture; see the [MLS integration fixture contract](Docs/MLS_INTEGRATION_FIXTURES.md).
