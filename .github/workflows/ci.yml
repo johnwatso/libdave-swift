@@ -35,12 +35,25 @@ jobs:
       # Build from a clean checkout (no cached .build) so the C++ stdlib
       # linkage and binary deployment target are exercised the same way a
       # fresh consumer would hit them.
+      #
+      # Warnings are errors here: this package makes explicit Sendable and
+      # isolation claims, and a concurrency warning is how the compiler reports
+      # that one of them stopped holding.
       - name: Build
-        run: swift build -v
+        run: swift build -v -Xswiftc -warnings-as-errors
 
       - name: Test
         run: swift test -v
 
+      # Release builds optimize differently and drop debug preconditions, so a
+      # debug-only test run can miss both miscompiles and behavior that depends
+      # on assertions being live.
+      - name: Test (release configuration)
+        run: swift test -c release
+
+      # Also a regression check on the manifest's tools version: this consumer
+      # declares swift-tools-version 5.9, so it fails if the package ever
+      # becomes unusable from an older manifest.
       - name: Consumer package smoke test
         run: |
           tmpdir="$(mktemp -d)"
@@ -78,11 +91,45 @@ jobs:
           # failures against the bundled xcframework that a build alone misses.
           swift run ConsumerSmoke
 
+  sanitizers:
+    # The wrapper hands untrusted bytes to C++ across manually managed buffers
+    # and routes native callbacks back into Swift, so memory and threading
+    # errors are the failure modes that unit tests alone will not surface.
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Test under AddressSanitizer
+        env:
+          # Leak detection is unavailable on macOS; the rest of ASan applies.
+          ASAN_OPTIONS: detect_leaks=0
+        run: swift test --sanitize=address
+
+      # DAVE_DEFAULT_ACTOR_EXECUTOR swaps the coordinator's dedicated serial
+      # queue for the default actor executor *for this job only*.
+      #
+      # ThreadSanitizer cannot see the happens-before edge that Swift's
+      # custom-executor enqueue path establishes, so with the shipping executor
+      # every hop between two actor-isolated methods is reported as a race even
+      # though the queue provably serializes them. Building against the default
+      # executor keeps race detection meaningful for the state-machine logic
+      # rather than burying it in false positives. The serialization guarantee
+      # itself is covered by ExecutorSerializationTests, which runs in the
+      # normal (dedicated-executor) test job above.
+      #
+      # halt_on_error makes a detected race fail the job: TSan otherwise
+      # reports and exits zero.
+      - name: Test under ThreadSanitizer
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: swift test --sanitize=thread -Xswiftc -DDAVE_DEFAULT_ACTOR_EXECUTOR
+
   verify-release-metadata:
     # A Swift package's release version is its Git tag. Refuse a release tag
     # that is not a plain SemVer version or has no corresponding release notes.
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build-and-test
+    needs: [build-and-test, sanitizers]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

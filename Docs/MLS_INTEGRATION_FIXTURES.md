@@ -2,6 +2,20 @@
 
 The unit tests cover wrapper and state-machine behavior, but a real encrypted DAVE integration test needs genuine, internally consistent MLS artifacts. Do not substitute random bytes: an external sender, key package, Welcome, Commit, roster, and ratchets are bound to one MLS group state.
 
+## Running a fixture
+
+`Tests/libdave-swiftTests/MLSIntegrationFixtureTests.swift` is the harness for
+these fixtures. Drop a JSON file into
+`Tests/libdave-swiftTests/Fixtures/mls-integration/` and it runs automatically;
+see `EXAMPLE.json.txt` in that directory for the format.
+
+Until a fixture is captured, `testCapturedMlsSessionsRunEndToEnd` skips with an
+explanation, so the missing coverage is visible in test output rather than
+silently absent. A committed `harness-selfcheck.json` — malformed bytes only,
+no secret material — keeps the harness's own discovery, decoding, and assertion
+paths exercised in the meantime, so a captured fixture lands in a harness that
+is known to work.
+
 ## Fixture inputs
 
 Capture these from a disposable, non-production test Voice session or generate them with a controlled upstream libdave harness:

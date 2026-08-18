@@ -5,7 +5,7 @@
 <h1 align="center">libdave-swift</h1>
 
 <p align="center">
-  <a href="https://swift.org"><img src="https://img.shields.io/badge/Swift-5.9-orange.svg" alt="Swift 5.9"></a>
+  <a href="https://swift.org"><img src="https://img.shields.io/badge/Swift-6.0-orange.svg" alt="Swift 6.0"></a>
   <a href="https://www.swift.org/package-manager/"><img src="https://img.shields.io/badge/SPM-compatible-brightgreen.svg" alt="Swift Package Manager compatible"></a>
   <a href="Package.swift"><img src="https://img.shields.io/badge/platform-macOS%2026%2B-lightgrey.svg" alt="Platform: macOS 26+"></a>
 </p>
@@ -18,7 +18,7 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 
 > [!NOTE]
 > **Development Note**
-> This Swift Package was generated with the assistance of an AI coding agent. While the codebase compiles successfully, passes its initial unit tests, and implements standard memory-safe wrappers, it is recommended to perform standard validation and testing before deploying in production environments.
+> This Swift Package was generated with the assistance of an AI coding agent. While the codebase compiles successfully, passes its unit tests (including randomized state-machine tests, and AddressSanitizer/ThreadSanitizer runs in CI), and implements standard memory-safe wrappers, it is recommended to perform standard validation and testing before deploying in production environments. In particular, the media and MLS paths still lack an end-to-end test against genuine MLS artifacts; see [Docs/MLS_INTEGRATION_FIXTURES.md](Docs/MLS_INTEGRATION_FIXTURES.md).
 
 ---
 
@@ -27,12 +27,15 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 * **Self-Contained Integration:** The bundled `Dave.xcframework` contains the native DAVE/MLS/libcrypto implementation, so client applications need no CMake or vcpkg installation. Its checksum-backed, evidence-limited component inventory is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 * **Type-Safe Swift Interfaces:** Raw C pointers and manual allocations are mapped behind standard Swift classes (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`).
 * **High-Level Coordinator:** `DaveSessionCoordinator` is an `actor` that orchestrates the session, key ratchets, and media crypto behind one async API, exposing handshake state and `DaveDiagnostics`.
-* **Persistent Signature Identity:** Passing an `authSessionId` gives the session a persisted MLS signature key pair (stored under `$XDG_CONFIG_HOME`/`~/.config` in `Discord Key Storage/`), so the client keeps a stable identity across reconnects — matching official Discord clients. Passing `nil` uses a fresh ephemeral identity per session.
+* **Persistent Signature Identity:** Passing an `authSessionId` gives the session a persisted MLS signature key pair (stored under `$XDG_CONFIG_HOME`/`~/.config` in `Discord Key Storage/`, with the directory tightened to `0700`), so the client keeps a stable identity across reconnects — matching official Discord clients. Passing `nil` uses a fresh ephemeral identity per session. See [SECURITY.md](SECURITY.md) for the identity lifecycle.
 * **Full-Duplex Media:** The coordinator handles both directions — `encryptDiscordAudioFrame` for outbound audio and `decryptDiscordAudioFrame(_:from:)` for inbound, with one decryptor per remote speaker kept in step with the MLS roster after every welcome/commit.
 * **Discord Action Flow:** Coordinator helpers emit typed outbound actions for Discord Voice gateway messages such as MLS key packages, commit/welcome payloads, transition-ready, and invalid commit/welcome recovery.
-* **Recovery Diagnostics:** Typed recovery hints, external sender state, pending epoch/transition tracking, and a media-readiness watchdog make stalled DAVE transitions visible without parsing logs.
+* **Recovery Diagnostics:** Typed recovery hints, external sender state, pending epoch/transition tracking, and a monotonic media-readiness watchdog make stalled DAVE transitions visible without parsing logs. The watchdog deadline is immune to wall-clock jumps and sleep/wake.
+* **Built for Long Sessions:** The replay ledger and staged-transition window age out oldest-first rather than failing the session when they fill, while never evicting live state or actions the host has not acknowledged. Native callback contexts and replaced key ratchets are reclaimed on a grace window instead of accumulating for the lifetime of the process.
+* **Roster Verification:** Every applied transition reports the MLS roster and, against the participants Discord announced, any member that was never recognized — with signatures and the epoch authenticator available for identity verification UI. `DaveCoordinatorLimits.unrecognizedRosterMemberPolicy` chooses between reporting it and failing the session closed.
+* **Identity Lifecycle:** `DavePersistedIdentityStore` locates, permission-hardens, and purges the persisted MLS signature keys, so an identity can be dropped on logout instead of outliving the credential it was created for.
 * **Contained Concurrency:** The coordinator runs on its own dedicated serial executor, so the synchronous, blocking native MLS calls underneath can never starve the host's shared cooperative thread pool — a stalled native call stays contained to that one thread.
-* **Strict-Concurrency Clean:** The package builds warning-free with strict concurrency checking enabled. The low-level wrappers (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`) are intentionally **not `Sendable`** because the native state underneath is not thread-safe; serialize access through one actor or queue — the coordinator does this for you.
+* **Swift 6 Language Mode:** The package builds in the Swift 6 language mode, so its `Sendable` and isolation claims over non-thread-safe native state are compiler-enforced rather than advisory. Requires a Swift 6 toolchain, which the required macOS 26 SDK provides. The low-level wrappers (`DaveSession`, `DaveEncryptor`, `DaveDecryptor`) are intentionally **not `Sendable`** because the native state underneath is not thread-safe; serialize access through one actor or queue — the coordinator does this for you.
 * **Lifecycle Management:** C++ session handles are managed automatically, freeing resources in `deinit` to prevent memory leaks.
 * **Callback Routing:** C-style function pointer callbacks are bridged to standard Swift closures.
 
@@ -49,7 +52,7 @@ Add the dependency to your project in Xcode, or append it to your `Package.swift
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/johnwatso/libdave-swift.git", exact: "2.0.1")
+    .package(url: "https://github.com/johnwatso/libdave-swift.git", exact: "3.0.0")
 ]
 ```
 
@@ -64,7 +67,7 @@ Then add the product target `libdave-swift` as a dependency in your application:
 )
 ```
 
-The package version is the plain SemVer Git tag (for example, `2.0.1`), not a
+The package version is the plain SemVer Git tag (for example, `3.0.0`), not a
 field inside `Package.swift`. For production deployments, pin a verified tag;
 see [CHANGELOG.md](CHANGELOG.md) for behavior changes and
 [Docs/MIGRATING_TO_2.0.md](Docs/MIGRATING_TO_2.0.md) for the 2.0 integration
@@ -127,6 +130,17 @@ guard executed.mediaReady else { throw DaveError.mediaNotReady }
 // Only now: encrypt outbound Opus before RTP packetization, and decrypt inbound payloads.
 let ciphertext = try await coordinator.encryptDiscordAudioFrame(opusFrame, ssrc: audioSSRC)
 let plaintext = try await coordinator.decryptDiscordAudioFrame(incomingEncryptedPayload, from: remoteSnowflakeID)
+```
+
+After each applied transition, check `result.unrecognizedRosterUserIds`: a
+non-empty value means the MLS group contains a member the voice session never
+announced, which is the case end-to-end encryption exists to make visible.
+
+```swift
+if !transition.unrecognizedRosterUserIds.isEmpty {
+    // Surface this to the user; configure `.failClosed` to stop media instead.
+    logger.warning("unannounced group members: \(transition.unrecognizedRosterUserIds)")
+}
 ```
 
 `sendToVoiceGateway(_:)` is your adapter for `DiscordDaveOutboundAction`: map `.mlsKeyPackage`, `.mlsCommitWelcome`, `.transitionReady`, and `.invalidCommitWelcome` to the corresponding Voice gateway opcodes. On a failed write, do **not** acknowledge the envelope: ask `pendingDiscordGatewayActions()` for the same ordered bytes after reconnect. Commits and epoch preparation use the same `consumeDiscordGatewayEvent(_:)` flow. Handle `result.recoveryHint` and `result.needsRecovery`; the coordinator returns the ordered invalid-transition recovery actions when applicable.

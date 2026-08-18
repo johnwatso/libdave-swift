@@ -4,6 +4,105 @@ All notable changes to `libdave-swift` are documented here. The version is the
 SemVer Git tag (for example, `1.3.1`); `Package.swift` intentionally does not
 carry a second, independently mutable version number.
 
+## [3.0.0] - 2026-08-19
+
+### Release recommendation
+
+Publish as **3.0.0**. Two cases are added to the public `DaveError` enum, which
+breaks exhaustive switches — the same reason 2.0.0 was a major release.
+Everything else in this batch is source-compatible: new parameters have
+defaults, new result properties are additive, and `DaveDiagnostics` now decodes
+older payloads instead of rejecting them.
+
+### Breaking
+
+- `DaveError` gains `invalidAuthSessionId` and `unrecognizedRosterMembers`.
+  Consumers with exhaustive switches must handle them.
+- The package now builds in the Swift 6 language mode and its manifest uses
+  swift-tools-version 6.0, so a Swift 6 toolchain is required. This is not a
+  new constraint in practice: the package already requires macOS 26, whose SDK
+  ships one.
+
+### Fixed
+
+- **Fixed a process crash (SIGSEGV) on an empty external-sender payload.**
+  `DaveSession.setExternalSender(Data())` reached a native unmarshaller that
+  reads the buffer without checking its length. The wrapper's `baseAddress`
+  check did not prevent it, because empty `Data` may still vend a non-`nil`
+  pointer. All buffer-taking MLS entry points now reject zero-length input
+  before crossing into native code. `DaveSessionCoordinator` already validated
+  empty payloads, so only direct users of the low-level API were affected.
+
+- **A long call no longer fails closed once its transition window fills.** The
+  replay ledger and the staged-transition window are now aged out oldest-first
+  instead of failing the session at `maximumTrackedTransitions`. Each Discord
+  transition stored two permanent ledger entries, so at the default bound a
+  session died after roughly thirty membership changes — reachable within a
+  single busy voice call. Entries with unacknowledged outbound actions, and
+  those for the active or a still-staged transition, are never evicted, so
+  gateway retries and live state keep working. `DaveDiagnostics` reports
+  `evictedTransitionCount`.
+- **Native callback contexts are reclaimed.** Contexts were retained until
+  process exit — one per session, one per rebuilt encryptor, and one per
+  pairwise-fingerprint request — so a client that reconnected and verified
+  identities grew memory for as long as it ran. They are now retired when their
+  owner tears down and reclaimed after a grace window, with a hard ceiling.
+- **A replaced key ratchet is no longer destroyed while native code may still
+  read it.** `dave.h` documents that the cryptors borrow a ratchet handle
+  without taking ownership, and libdave's decryptor keeps using the previous
+  epoch's ratchet for frames already in flight when a re-key lands. Replaced
+  ratchets are now held for a grace window that comfortably exceeds the native
+  transition expiry.
+- **The media-readiness watchdog runs on a monotonic clock.** An NTP correction
+  or a sleep/wake cycle could previously expire a healthy transition
+  immediately or postpone a stalled one indefinitely.
+- The async pairwise-fingerprint call can no longer suspend forever if a
+  native callback never arrives; it returns `nil` after a timeout.
+
+### Added
+
+- Roster verification. `DiscordDaveTransitionResult` and
+  `DiscordDaveGatewayResult` carry `rosterUserIds` and
+  `unrecognizedRosterUserIds`, and the coordinator exposes `currentRoster()`,
+  `unrecognizedRosterMembers()`, `rosterMemberSignature(for:)`, and
+  `epochAuthenticator()`. A roster member the voice session never announced is
+  what an end-to-end encrypted call exists to surface; it is always reported,
+  and `DaveCoordinatorLimits.unrecognizedRosterMemberPolicy` can escalate it to
+  a fail-closed session.
+- `DavePersistedIdentityStore` for the MLS signature keys written when an
+  `authSessionId` is used: locate them, purge one identity (on logout or
+  account switch) or all of them, and harden their permissions.
+- `DaveCoordinatorLimits.mediaReadinessTimeout`, replacing a 10-second default
+  that was repeated through the coordinator. Per-call `timeout` parameters now
+  default to it.
+- A randomized state-machine test suite driving random gateway sequences
+  through `consumeDiscordGatewayEvent(_:)` and asserting the safety invariants
+  after every step, plus a test that proves the coordinator's dedicated serial
+  executor really does serialize actor work.
+- A native-boundary fuzz suite that drives the MLS and media entry points with
+  adversarial payloads, including mutations of a genuine marshalled key
+  package, which reach far deeper into the native parser than random bytes.
+  This is what surfaced the empty-external-sender crash above.
+- Reconnect soak tests that cycle sessions, cryptors, and the full coordinator
+  lifecycle hundreds of times and assert that no native lifetime accumulates.
+- A fixture-driven MLS integration harness. A captured session dropped into
+  `Tests/libdave-swiftTests/Fixtures/mls-integration/` now runs end to end
+  without new code; until then the test skips with an explanation, so the one
+  remaining coverage gap is visible in test output. A committed self-check
+  fixture keeps the harness itself exercised.
+- AddressSanitizer and ThreadSanitizer CI jobs, a release-configuration test
+  run, and `-warnings-as-errors` on the build.
+
+### Security
+
+- An `authSessionId` is validated before it reaches native code. It is
+  interpolated straight into a key-store filename, so a value containing a path
+  separator or `..` could place or delete a signature key outside the identity
+  directory.
+- The identity directory is tightened from `0755` to `0700` on session
+  creation. The native library already creates key files `0600`, but the
+  world-readable directory let any local user enumerate which identities exist.
+
 ## [2.0.1] - 2026-08-05
 
 ### Fixed
