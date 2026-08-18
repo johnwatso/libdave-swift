@@ -16,6 +16,42 @@ no secret material — keeps the harness's own discovery, decoding, and assertio
 paths exercised in the meantime, so a captured fixture lands in a harness that
 is known to work.
 
+## What a captured fixture can and cannot verify
+
+**A captured Welcome cannot be replayed into a fresh session.** This is a
+property of MLS plus the current C API, not a limitation of the harness, and it
+bounds what this whole approach can prove.
+
+A Welcome seals the group secrets to the HPKE init key in the key package the
+joining client published. `daveSessionGetMarshalledKeyPackage` returns a *new*
+init key on every call — verified: two reads from a single session differ, and
+so do two sessions sharing one `authSessionId`. With a persisted identity the
+signature and encryption keys are stable, but the init key is regenerated and
+never written to the key store, so its private half exists only in the memory of
+the process that generated it. Once that process exits, no later session can
+decrypt that Welcome.
+
+A captured fixture therefore verifies:
+
+- that genuine external-sender bytes are accepted and produce a key package;
+- that genuine Welcome/Commit bytes drive the gateway state machine, action
+  emission, and transition sequencing as expected; and
+- that malformed or out-of-order real-world sequences recover correctly.
+
+It cannot verify key ratchet installation, re-keying, or encrypted media
+round-trips, because all three sit behind decrypting the Welcome.
+
+Closing that remaining gap needs one of:
+
+- **an in-process loopback**, by extending the C shim in the upstream C++
+  repository with test-only entry points that mint an external sender and its
+  proposals. Two clients can then be driven through a full join, re-key, and
+  media exchange with no captured data, and it runs in CI; or
+- **a live verification run** against a disposable Voice channel, asserting the
+  same properties in-process while the session is still alive. This exercises
+  the real path but produces nothing replayable, so it is a manual gate rather
+  than a regression test.
+
 ## Fixture inputs
 
 Capture these from a disposable, non-production test Voice session or generate them with a controlled upstream libdave harness:
