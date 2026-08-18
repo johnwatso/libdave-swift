@@ -146,6 +146,23 @@ public enum DaveRecoveryHint: String, Codable, Sendable, CustomStringConvertible
     }
 }
 
+/// What the coordinator does when the MLS roster contains a member the host
+/// never listed as recognized.
+///
+/// Discord supplies the expected participants alongside a Welcome. A member
+/// present in the resulting MLS roster but absent from that list is exactly the
+/// signal an end-to-end encrypted call is supposed to make visible: someone is
+/// in the cryptographic group who is not in the call the user believes they
+/// joined.
+public enum DaveRosterVerificationPolicy: String, Codable, Sendable {
+    /// Surface unrecognized members through results and diagnostics, but let
+    /// media continue. The host decides how to present or act on it.
+    case report
+    /// Treat an unrecognized member as unrecoverable: fail the session closed
+    /// so no media is encrypted to, or decrypted from, that group.
+    case failClosed
+}
+
 /// Resource limits applied by ``DaveSessionCoordinator`` before untrusted
 /// gateway bytes are handed to the native MLS implementation.
 ///
@@ -159,19 +176,29 @@ public struct DaveCoordinatorLimits: Sendable, Equatable {
     public var maximumMediaFrameBytes: Int
     public var maximumTrackedTransitions: Int
     public var maximumPendingOutboundActions: Int
+    /// Default seconds a transition may stay un-executed before the media
+    /// readiness watchdog fails the session closed. Individual calls may still
+    /// pass an explicit timeout.
+    public var mediaReadinessTimeout: TimeInterval
+    /// How an MLS roster member the host never recognized is handled.
+    public var unrecognizedRosterMemberPolicy: DaveRosterVerificationPolicy
 
     public init(
         maximumMlsPayloadBytes: Int = 1_048_576,
         maximumRosterMembers: Int = 1_000,
         maximumMediaFrameBytes: Int = 65_535,
         maximumTrackedTransitions: Int = 64,
-        maximumPendingOutboundActions: Int = 64
+        maximumPendingOutboundActions: Int = 64,
+        mediaReadinessTimeout: TimeInterval = 10,
+        unrecognizedRosterMemberPolicy: DaveRosterVerificationPolicy = .report
     ) {
         self.maximumMlsPayloadBytes = max(1, maximumMlsPayloadBytes)
         self.maximumRosterMembers = max(1, maximumRosterMembers)
         self.maximumMediaFrameBytes = max(1, maximumMediaFrameBytes)
         self.maximumTrackedTransitions = max(1, maximumTrackedTransitions)
         self.maximumPendingOutboundActions = max(1, maximumPendingOutboundActions)
+        self.mediaReadinessTimeout = max(0, mediaReadinessTimeout)
+        self.unrecognizedRosterMemberPolicy = unrecognizedRosterMemberPolicy
     }
 
     public static let `default` = DaveCoordinatorLimits()
@@ -255,17 +282,28 @@ public struct DiscordDaveGatewayResult: Sendable {
     public let mediaReady: Bool
     public let recoveryHint: DaveRecoveryHint
     public let diagnostics: DaveDiagnostics
+    /// MLS roster after the most recently applied transition, as decimal
+    /// Discord Snowflakes. Empty until a Welcome or Commit has been applied.
+    public let rosterUserIds: [String]
+    /// Roster members the host never listed as recognized. A non-empty value
+    /// means the cryptographic group contains someone the voice session did
+    /// not announce; see ``DaveRosterVerificationPolicy``.
+    public let unrecognizedRosterUserIds: [String]
 
     public init(
         pendingActions: [DiscordDaveOutboundActionEnvelope],
         mediaReady: Bool,
         recoveryHint: DaveRecoveryHint,
-        diagnostics: DaveDiagnostics
+        diagnostics: DaveDiagnostics,
+        rosterUserIds: [String] = [],
+        unrecognizedRosterUserIds: [String] = []
     ) {
         self.pendingActions = pendingActions
         self.mediaReady = mediaReady
         self.recoveryHint = recoveryHint
         self.diagnostics = diagnostics
+        self.rosterUserIds = rosterUserIds
+        self.unrecognizedRosterUserIds = unrecognizedRosterUserIds
     }
 
     public var needsRecovery: Bool {
@@ -284,17 +322,27 @@ public struct DiscordDaveTransitionResult: Sendable {
     public let mediaReady: Bool
     public let recoveryHint: DaveRecoveryHint
     public let diagnostics: DaveDiagnostics
+    /// MLS roster after the most recently applied transition, as decimal
+    /// Discord Snowflakes. Empty until a Welcome or Commit has been applied.
+    public let rosterUserIds: [String]
+    /// Roster members the host never listed as recognized. See
+    /// ``DiscordDaveGatewayResult/unrecognizedRosterUserIds``.
+    public let unrecognizedRosterUserIds: [String]
 
     public init(
         outboundActions: [DiscordDaveOutboundAction],
         mediaReady: Bool,
         recoveryHint: DaveRecoveryHint,
-        diagnostics: DaveDiagnostics
+        diagnostics: DaveDiagnostics,
+        rosterUserIds: [String] = [],
+        unrecognizedRosterUserIds: [String] = []
     ) {
         self.outboundActions = outboundActions
         self.mediaReady = mediaReady
         self.recoveryHint = recoveryHint
         self.diagnostics = diagnostics
+        self.rosterUserIds = rosterUserIds
+        self.unrecognizedRosterUserIds = unrecognizedRosterUserIds
     }
 
     public var needsRecovery: Bool {
@@ -340,6 +388,8 @@ public enum DaveError: Error, LocalizedError, Sendable {
     case invalidMediaFrameSize(actual: Int, maximum: Int)
     case sessionFailed
     case notConfigured
+    case invalidAuthSessionId(String)
+    case unrecognizedRosterMembers(userIds: [String])
 
     public var errorDescription: String? {
         switch self {
@@ -391,6 +441,10 @@ public enum DaveError: Error, LocalizedError, Sendable {
             return "The DAVE session has failed closed. Recreate it before accepting more gateway events."
         case .notConfigured:
             return "DAVE Session Coordinator is not configured. Please call configureForDiscordVoice first."
+        case .invalidAuthSessionId(let authSessionId):
+            return "Invalid auth session ID: '\(authSessionId)'. It is used as a key-store filename, so it must be non-empty, at most 128 UTF-8 bytes, and free of path separators, '..', and control characters."
+        case .unrecognizedRosterMembers(let userIds):
+            return "The MLS roster contains \(userIds.count) member(s) the voice session never recognized: \(userIds.joined(separator: ", "))."
         }
     }
 
@@ -448,6 +502,10 @@ public enum DaveError: Error, LocalizedError, Sendable {
             return .recreateSession
         case .notConfigured:
             return .fatal
+        case .invalidAuthSessionId:
+            return .fatal
+        case .unrecognizedRosterMembers:
+            return .recreateSession
         }
     }
 }

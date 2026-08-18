@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
@@ -32,9 +32,17 @@ let package = Package(
             path: "Sources/libdave-swift",
             swiftSettings: [
                 // The wrapper types make explicit Sendable/isolation claims
-                // (actor coordinator, @unchecked Sendable handle wrappers).
-                // Strict checking keeps those claims honest at compile time.
-                .enableExperimentalFeature("StrictConcurrency")
+                // (actor coordinator, @unchecked Sendable handle wrappers) over
+                // native state that is not thread-safe. The Swift 6 language
+                // mode turns those claims into compiler-enforced guarantees
+                // rather than warnings, so a future change that shares a
+                // non-Sendable cryptor across concurrency domains fails to
+                // build instead of failing in production.
+                //
+                // This requires a Swift 6 toolchain, which is not an added
+                // constraint in practice: the package already requires
+                // macOS 26, whose SDK ships with one.
+                .swiftLanguageMode(.v6)
             ],
             linkerSettings: [
                 // Dave.xcframework is a C-API shim over a C++ implementation
@@ -61,7 +69,7 @@ let package = Package(
                 .copy("Fixtures")
             ],
             swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
+                .swiftLanguageMode(.v6)
             ]
         )
     ],

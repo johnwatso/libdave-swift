@@ -21,6 +21,10 @@ public final class DaveEncryptor {
     // `daveEncryptorSetKeyRatchet` borrows this handle; it does not take
     // ownership. Keep the Swift wrapper alive for every native encrypt call.
     private var keyRatchet: DaveKeyRatchet?
+    // Replaced ratchets are parked rather than destroyed, for the same reason
+    // as in `DaveDecryptor`: the C API borrows the handle, so nothing here can
+    // prove native code has finished with it the instant it is replaced.
+    private var retiredRatchets = DaveRetiredRatchetPool()
     private let lock = NSLock()
 
     /// Creates a new media frame encryptor.
@@ -45,6 +49,9 @@ public final class DaveEncryptor {
             // future delivery before destruction. The tombstone remains for
             // any callback that was already in flight.
             daveEncryptorSetProtocolVersionChangedCallback(handle, nil, nil)
+            // Retire only what native code was actually handed; an unregistered
+            // bridge is owned solely by this encryptor and needs no tombstone.
+            DaveNativeCallbackContextRetainer.shared.retireAfterNativeLifetime(callbackBridge)
         }
         daveEncryptorDestroy(handle)
     }
@@ -53,6 +60,9 @@ public final class DaveEncryptor {
     public func setKeyRatchet(_ keyRatchet: DaveKeyRatchet) {
         // Retain before crossing the native boundary so the handle remains
         // valid even when the caller supplied a temporary local value.
+        if let previous = self.keyRatchet, previous !== keyRatchet {
+            retiredRatchets.retire(previous)
+        }
         self.keyRatchet = keyRatchet
         daveEncryptorSetKeyRatchet(handle, keyRatchet.handle)
     }
@@ -97,6 +107,9 @@ public final class DaveEncryptor {
     ///   - frame: The plaintext frame bytes.
     /// - Returns: The encrypted frame bytes.
     public func encrypt(mediaType: DaveMediaType, ssrc: UInt32, frame: Data) throws -> Data {
+        // Releases parked ratchets once their window has passed (see
+        // `setKeyRatchet`); a no-op on the common steady-state path.
+        retiredRatchets.prune()
         let maxCapacity = maxCiphertextByteSize(mediaType: mediaType, frameSize: frame.count)
         var encryptedData = Data(count: maxCapacity)
         var bytesWritten: Int = 0

@@ -9,24 +9,141 @@ import CDave
 /// object immediately after destroying its native owner would therefore leave
 /// a possible use-after-free in the C-to-Swift callback trampoline.
 ///
-/// Contexts registered here deliberately live until process exit. Their
-/// owners call `deactivate()` during teardown, which releases application
-/// closures and makes later callbacks no-ops. This is a small, intentional
-/// tombstone allocation per native callback owner; it is the only safe
-/// lifetime policy available with the current ABI. The native library should
-/// eventually provide either an unregister-and-drain API or a documented
-/// guarantee that no callback can begin after its owner is destroyed.
+/// Contexts are registered while their owner is live and *retired* when the
+/// owner tears down. A retired context stays allocated for
+/// ``retirementGrace`` so that a callback already in flight lands on a valid
+/// (deactivated, inert) object, and is then reclaimed. Native destruction is
+/// synchronous in the bundled implementation, so a callback arriving after
+/// the grace window would mean the C library invoked a context for an object
+/// it destroyed tens of seconds earlier — far outside anything it does today.
+///
+/// Reclaiming matters because registrations are not rare: one per session,
+/// one per rebuilt encryptor, and one per pairwise-fingerprint request. A
+/// long-running voice client that reconnects and verifies identities would
+/// otherwise grow this table for the lifetime of the process.
 internal final class DaveNativeCallbackContextRetainer: @unchecked Sendable {
     static let shared = DaveNativeCallbackContextRetainer()
 
+    /// How long a retired context remains allocated before it is reclaimed.
+    private static let retirementGrace: Duration = .seconds(30)
+    /// Hard ceiling on retained contexts. Reached only if a host registers
+    /// contexts far faster than the grace window reclaims them; the oldest
+    /// retired entries are dropped first, and live entries are never dropped.
+    private static let maximumRetainedContexts = 512
+
+    private struct Entry {
+        let id: ObjectIdentifier
+        let context: AnyObject
+        var retiredAt: ContinuousClock.Instant?
+    }
+
     private let lock = NSLock()
-    private var contexts: [AnyObject] = []
+    /// Insertion-ordered, so eviction can prefer the longest-retired entries.
+    private var entries: [Entry] = []
 
     private init() {}
 
     func retainForNativeLifetime(_ context: AnyObject) {
         lock.lock()
-        contexts.append(context)
+        entries.append(Entry(id: ObjectIdentifier(context), context: context, retiredAt: nil))
+        reclaimLocked()
+        lock.unlock()
+    }
+
+    /// Marks a context as belonging to a torn-down owner. It is reclaimed once
+    /// the grace window has elapsed.
+    func retireAfterNativeLifetime(_ context: AnyObject) {
+        let id = ObjectIdentifier(context)
+        lock.lock()
+        if let index = entries.lastIndex(where: { $0.id == id }), entries[index].retiredAt == nil {
+            entries[index].retiredAt = ContinuousClock.now
+        }
+        reclaimLocked()
+        lock.unlock()
+    }
+
+    /// Number of contexts currently held. Exposed for tests asserting that the
+    /// table does not grow without bound.
+    var retainedContextCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.count
+    }
+
+    /// Drops retired contexts whose grace window has elapsed, then enforces the
+    /// hard ceiling by dropping the longest-retired entries first. A
+    /// monotonic clock is used so a wall-clock adjustment cannot reclaim a
+    /// context early.
+    private func reclaimLocked() {
+        let now = ContinuousClock.now
+        entries.removeAll { entry in
+            guard let retiredAt = entry.retiredAt else { return false }
+            return now - retiredAt >= Self.retirementGrace
+        }
+
+        guard entries.count > Self.maximumRetainedContexts else { return }
+        var overflow = entries.count - Self.maximumRetainedContexts
+        var survivors: [Entry] = []
+        survivors.reserveCapacity(entries.count)
+        for entry in entries {
+            if overflow > 0, entry.retiredAt != nil {
+                overflow -= 1
+                continue
+            }
+            survivors.append(entry)
+        }
+        entries = survivors
+    }
+}
+
+/// Resumes exactly one awaiting caller, whichever of several possible
+/// deliveries arrives first, and tolerates a delivery that happens before the
+/// continuation is attached.
+///
+/// This is what lets an `async` wrapper around a C callback impose a timeout:
+/// the native callback and the timeout both call ``deliver(_:)``, and only the
+/// first one resumes the continuation.
+internal final class DaveSingleShotResume<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Never>?
+    private var bufferedValue: Value?
+    private var hasDelivered = false
+    private var hasResumed = false
+
+    init() {}
+
+    /// Attaches the awaiting continuation. If a value was already delivered,
+    /// the continuation resumes immediately.
+    func attach(_ continuation: CheckedContinuation<Value, Never>) {
+        lock.lock()
+        if hasDelivered, !hasResumed, let value = bufferedValue {
+            hasResumed = true
+            bufferedValue = nil
+            lock.unlock()
+            continuation.resume(returning: value)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    /// Delivers a result. Only the first call has any effect, so a late native
+    /// callback can never resume a continuation twice.
+    func deliver(_ value: Value) {
+        lock.lock()
+        guard !hasDelivered else {
+            lock.unlock()
+            return
+        }
+        hasDelivered = true
+        if let continuation, !hasResumed {
+            hasResumed = true
+            self.continuation = nil
+            lock.unlock()
+            continuation.resume(returning: value)
+            return
+        }
+        bufferedValue = value
         lock.unlock()
     }
 }
@@ -126,9 +243,16 @@ internal final class DaveFingerprintCallbackBridge: @unchecked Sendable {
     func deliver(_ fingerprint: Data?) {
         lock.lock()
         let callback = self.callback
+        let wasPending = callback != nil
         self.callback = nil
         lock.unlock()
         callback?(fingerprint)
+        if wasPending {
+            // This bridge is single-shot: once the one expected callback has
+            // been consumed, its tombstone can start aging out instead of
+            // being retained for the lifetime of the process.
+            DaveNativeCallbackContextRetainer.shared.retireAfterNativeLifetime(self)
+        }
     }
 }
 

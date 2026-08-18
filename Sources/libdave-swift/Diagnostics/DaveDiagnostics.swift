@@ -48,6 +48,16 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
     public let hasIssuedInitialKeyPackage: Bool
     public let hasSentInitialKeyPackage: Bool
     public let pendingOutboundActionCount: Int
+    /// Members in the MLS roster after the most recently applied transition.
+    public let rosterMemberCount: Int
+    /// Roster members the host never listed as recognized. Anything above zero
+    /// means the cryptographic group is wider than the announced voice session.
+    public let unrecognizedRosterMemberCount: Int
+    /// Replay-ledger and staged-transition entries dropped to stay inside the
+    /// configured bounds. A steadily rising value on a long call is expected;
+    /// it is the signal that the session is aging out old state rather than
+    /// hitting a hard limit.
+    public let evictedTransitionCount: UInt64
 
     public init(
         sessionGeneration: UInt64 = 0,
@@ -67,7 +77,10 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         lastRecoveryAction: DaveRecoveryAction? = nil,
         hasIssuedInitialKeyPackage: Bool = false,
         hasSentInitialKeyPackage: Bool = false,
-        pendingOutboundActionCount: Int = 0
+        pendingOutboundActionCount: Int = 0,
+        rosterMemberCount: Int = 0,
+        unrecognizedRosterMemberCount: Int = 0,
+        evictedTransitionCount: UInt64 = 0
     ) {
         self.sessionGeneration = sessionGeneration
         self.protocolVersion = protocolVersion
@@ -87,6 +100,51 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         self.hasIssuedInitialKeyPackage = hasIssuedInitialKeyPackage
         self.hasSentInitialKeyPackage = hasSentInitialKeyPackage
         self.pendingOutboundActionCount = pendingOutboundActionCount
+        self.rosterMemberCount = rosterMemberCount
+        self.unrecognizedRosterMemberCount = unrecognizedRosterMemberCount
+        self.evictedTransitionCount = evictedTransitionCount
+    }
+
+    /// Decoding tolerates payloads written by an older release: fields added
+    /// after a diagnostics schema ships fall back to their defaults instead of
+    /// failing the whole decode. Diagnostics are frequently persisted or
+    /// forwarded to a monitoring pipeline, so a schema addition must not turn
+    /// archived records into decode errors.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionGeneration = try container.decodeIfPresent(UInt64.self, forKey: .sessionGeneration) ?? 0
+        protocolVersion = try container.decode(UInt16.self, forKey: .protocolVersion)
+        appliedTransitionCount = try container.decode(UInt64.self, forKey: .appliedTransitionCount)
+        handshakeState = try container.decode(DaveHandshakeState.self, forKey: .handshakeState)
+        encryptionStats = try container.decodeIfPresent(DaveEncryptorStats.self, forKey: .encryptionStats)
+        lastMlsError = try container.decodeIfPresent(String.self, forKey: .lastMlsError)
+        lastTransitionTimestamp = try container.decodeIfPresent(Date.self, forKey: .lastTransitionTimestamp)
+        isExternalSenderRegistered = try container.decode(Bool.self, forKey: .isExternalSenderRegistered)
+        mediaReady = try container.decodeIfPresent(Bool.self, forKey: .mediaReady) ?? false
+        pendingEpoch = try container.decodeIfPresent(UInt64.self, forKey: .pendingEpoch)
+        pendingTransitionId = try container.decodeIfPresent(UInt64.self, forKey: .pendingTransitionId)
+        activeTransitionId = try container.decodeIfPresent(UInt64.self, forKey: .activeTransitionId)
+        pendingTransitionIds = try container.decodeIfPresent([UInt64].self, forKey: .pendingTransitionIds) ?? []
+        externalSenderState = try container.decodeIfPresent(
+            DaveExternalSenderState.self,
+            forKey: .externalSenderState
+        ) ?? .missing
+        lastRecoveryAction = try container.decodeIfPresent(DaveRecoveryAction.self, forKey: .lastRecoveryAction)
+        hasIssuedInitialKeyPackage = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .hasIssuedInitialKeyPackage
+        ) ?? false
+        hasSentInitialKeyPackage = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .hasSentInitialKeyPackage
+        ) ?? false
+        pendingOutboundActionCount = try container.decodeIfPresent(Int.self, forKey: .pendingOutboundActionCount) ?? 0
+        rosterMemberCount = try container.decodeIfPresent(Int.self, forKey: .rosterMemberCount) ?? 0
+        unrecognizedRosterMemberCount = try container.decodeIfPresent(
+            Int.self,
+            forKey: .unrecognizedRosterMemberCount
+        ) ?? 0
+        evictedTransitionCount = try container.decodeIfPresent(UInt64.self, forKey: .evictedTransitionCount) ?? 0
     }
 
     public var debugDescription: String {
@@ -112,6 +170,9 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
           Initial Key Package Issued: \(hasIssuedInitialKeyPackage)
           Initial Key Package Sent: \(hasSentInitialKeyPackage)
           Pending Gateway Actions: \(pendingOutboundActionCount)
+          Roster Members: \(rosterMemberCount)
+          Unrecognized Roster Members: \(unrecognizedRosterMemberCount)
+          Evicted Transitions: \(evictedTransitionCount)
           Last MLS Error: \(lastMlsError ?? "None")
           Last Transition Timestamp: \(timestampStr)
           Encryption Stats (Audio): \(statsStr)

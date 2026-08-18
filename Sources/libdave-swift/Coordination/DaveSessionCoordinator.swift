@@ -39,6 +39,10 @@ public actor DaveSessionCoordinator {
         let outboundRatchet: DaveKeyRatchet?
     }
 
+    /// Label of the dedicated queue, also used by the test that verifies actor
+    /// work really is confined to it.
+    internal static let executorQueueLabel = "com.libdave.session.coordinator"
+
     /// Dedicated serial executor backing this actor.
     ///
     /// The DAVE/MLS calls underneath are synchronous, blocking C++/OpenSSL
@@ -48,10 +52,22 @@ public actor DaveSessionCoordinator {
     /// stall is contained to this one thread — the rest of the host keeps
     /// running — while still serializing access to the (non-thread-safe) native
     /// session state.
-    private let executorQueue = DispatchSerialQueue(label: "com.libdave.session.coordinator")
+    private let executorQueue = DispatchSerialQueue(label: executorQueueLabel)
+
+#if DAVE_DEFAULT_ACTOR_EXECUTOR
+    // Built only for the thread-sanitizer CI job. TSan cannot see the
+    // happens-before edge that Swift's custom-executor enqueue path
+    // establishes, so every hop between two actor-isolated methods is
+    // reported as a race even though the queue provably serializes them
+    // (see `ExecutorSerializationTests`). Running the sanitizer against the
+    // default actor executor keeps race detection meaningful for the actual
+    // state-machine logic instead of drowning it in false positives. Shipping
+    // builds always use the dedicated queue below.
+#else
     public nonisolated var unownedExecutor: UnownedSerialExecutor {
         executorQueue.asUnownedSerialExecutor()
     }
+#endif
 
     // Lifecycles owned by actor
     private var session: DaveSession?
@@ -114,10 +130,31 @@ public actor DaveSessionCoordinator {
     private var lastRecoveryAction: DaveRecoveryAction?
     private var hasIssuedInitialKeyPackage: Bool = false
     private var hasSentInitialKeyPackage: Bool = false
-    private var mediaReadinessWatchdogStartedAt: Date?
-    private var mediaReadinessWatchdogTimeout: TimeInterval = 10
+    /// Watchdog deadlines are tracked on a monotonic clock. Wall-clock time
+    /// moves: an NTP correction or a sleep/wake cycle would otherwise either
+    /// expire a healthy transition instantly or postpone a stalled one
+    /// indefinitely, and this watchdog is a safety boundary for media.
+    private var mediaReadinessWatchdogStartedAt: ContinuousClock.Instant?
+    /// Wall-clock companion, used only by the `Date`-based evaluation overload
+    /// that lets hosts and tests drive the watchdog from their own clock.
+    private var mediaReadinessWatchdogStartedDate: Date?
+    private var mediaReadinessWatchdogTimeout: TimeInterval
     private var mediaReadinessWatchdogReason: String?
     private var mediaReadinessWatchdogTask: Task<Void, Never>?
+    /// Ledger and staged-transition entries dropped to stay inside the
+    /// configured bounds. Surfaced through diagnostics so a host can see state
+    /// aging out rather than guessing why an old replay was reprocessed.
+    private var evictedTransitionCount: UInt64 = 0
+    /// MLS roster after the most recently applied transition.
+    private var rosterUserIds: [String] = []
+    /// Per-member signature captured from the applying commit/welcome, for
+    /// hosts that display or pin identity verification data.
+    private var rosterMemberSignatures: [String: Data] = [:]
+    /// Members the host most recently told us to expect. Populated from the
+    /// `recognizedUserIds` supplied with a Welcome or with proposals.
+    private var recognizedRosterUserIds: Set<String> = []
+    /// Roster members absent from `recognizedRosterUserIds`.
+    private var unrecognizedRosterUserIds: [String] = []
     /// Opcode 21 with transition ID zero is Discord's sole-member-reset
     /// signal. It immediately executes the new *pending* local group, which
     /// is intentionally not media-ready until native MLS later establishes a
@@ -131,6 +168,7 @@ public actor DaveSessionCoordinator {
     public init(authSessionId: String? = nil, limits: DaveCoordinatorLimits = .default) {
         self.authSessionId = authSessionId
         self.limits = limits
+        self.mediaReadinessWatchdogTimeout = limits.mediaReadinessTimeout
     }
 
     /// Configures the coordinator specifically for Discord Voice usage.
@@ -205,6 +243,10 @@ public actor DaveSessionCoordinator {
         hasIssuedInitialKeyPackage = false
         hasSentInitialKeyPackage = false
         soleMemberResetExecuteSeen = false
+        rosterUserIds.removeAll()
+        rosterMemberSignatures.removeAll()
+        recognizedRosterUserIds.removeAll()
+        unrecognizedRosterUserIds.removeAll()
         clearMediaReadinessWatchdog()
     }
 
@@ -337,7 +379,7 @@ public actor DaveSessionCoordinator {
         _ welcome: Data,
         transitionId: UInt64,
         recognizedUserIds: [String],
-        recoveryTimeout: TimeInterval = 10
+        recoveryTimeout: TimeInterval? = nil
     ) throws -> DiscordDaveTransitionResult {
         if let cached = cachedTransitionResult(
             kind: .welcome,
@@ -404,7 +446,7 @@ public actor DaveSessionCoordinator {
     public func processDiscordCommitForOutbound(
         _ commit: Data,
         transitionId: UInt64,
-        recoveryTimeout: TimeInterval = 10
+        recoveryTimeout: TimeInterval? = nil
     ) throws -> DiscordDaveTransitionResult {
         if let cached = cachedTransitionResult(
             kind: .commit,
@@ -596,7 +638,7 @@ public actor DaveSessionCoordinator {
         protocolVersion: UInt16,
         epoch: UInt64,
         transitionId: UInt64,
-        timeout: TimeInterval = 10
+        timeout: TimeInterval? = nil
     ) throws -> DiscordDaveTransitionResult {
         guard groupId != nil, selfUserId != nil else {
             throw DaveError.notConfigured
@@ -690,7 +732,7 @@ public actor DaveSessionCoordinator {
     @discardableResult
     public func recoverDiscordInvalidTransition(
         transitionId: UInt64,
-        timeout: TimeInterval = 10
+        timeout: TimeInterval? = nil
     ) throws -> DiscordDaveTransitionResult {
         let cachedExternalSender = externalSenderData
         try recreateSessionState()
@@ -721,7 +763,7 @@ public actor DaveSessionCoordinator {
         reason: String,
         pendingTransitionId: UInt64? = nil,
         pendingEpoch: UInt64? = nil,
-        timeout: TimeInterval = 10
+        timeout: TimeInterval? = nil
     ) -> DaveMediaReadinessWatchdogStatus {
         guard handshakeState != .failed else {
             return .timedOut(reason: "DAVE session failed closed", recoveryHint: .recreateSession)
@@ -731,8 +773,9 @@ public actor DaveSessionCoordinator {
         // later valid Execute can be rejected forever as a false mismatch.
         self.pendingTransitionId = pendingTransitionId
         self.pendingEpoch = pendingEpoch
-        mediaReadinessWatchdogStartedAt = Date()
-        mediaReadinessWatchdogTimeout = max(0, timeout)
+        mediaReadinessWatchdogStartedAt = .now
+        mediaReadinessWatchdogStartedDate = Date()
+        mediaReadinessWatchdogTimeout = max(0, timeout ?? limits.mediaReadinessTimeout)
         mediaReadinessWatchdogReason = reason
         lastRecoveryAction = .pauseMedia
         lastTransitionTimestamp = Date()
@@ -768,12 +811,24 @@ public actor DaveSessionCoordinator {
 
     /// Evaluates whether an in-flight DAVE media refresh has exceeded its
     /// allowed readiness window.
-    public func evaluateMediaReadinessWatchdog(now: Date = Date()) -> DaveMediaReadinessWatchdogStatus {
+    ///
+    /// - Parameter now: Optional wall-clock instant to evaluate against, for
+    ///   hosts and tests that drive the watchdog from their own clock. When
+    ///   omitted, a monotonic clock is used, so the deadline survives system
+    ///   clock adjustments and sleep/wake.
+    public func evaluateMediaReadinessWatchdog(now: Date? = nil) -> DaveMediaReadinessWatchdogStatus {
         guard !mediaReady, let startedAt = mediaReadinessWatchdogStartedAt else {
             return .inactive
         }
 
-        let remaining = mediaReadinessWatchdogTimeout - now.timeIntervalSince(startedAt)
+        let elapsed: TimeInterval
+        if let now, let startedDate = mediaReadinessWatchdogStartedDate {
+            elapsed = now.timeIntervalSince(startedDate)
+        } else {
+            elapsed = Self.seconds(ContinuousClock.now - startedAt)
+        }
+
+        let remaining = mediaReadinessWatchdogTimeout - elapsed
         guard remaining <= 0 else {
             return .pending(secondsRemaining: remaining)
         }
@@ -840,6 +895,38 @@ public actor DaveSessionCoordinator {
         return try decryptor.decrypt(mediaType: .audio, encryptedFrame: encryptedFrame)
     }
 
+    /// MLS roster after the most recently applied transition, as decimal
+    /// Discord Snowflakes. Empty until a Welcome or Commit has been applied.
+    public func currentRoster() -> [String] {
+        rosterUserIds
+    }
+
+    /// Roster members the host never listed as recognized.
+    ///
+    /// A non-empty result means the MLS group contains an identity the voice
+    /// session did not announce. Treat it as a verification failure worth
+    /// surfacing to the user, regardless of the configured policy.
+    public func unrecognizedRosterMembers() -> [String] {
+        unrecognizedRosterUserIds
+    }
+
+    /// Signature of a roster member captured from the transition that admitted
+    /// them, for hosts that display or pin identity verification data.
+    public func rosterMemberSignature(for userId: String) -> Data? {
+        rosterMemberSignatures[userId]
+    }
+
+    /// Authenticator for the last MLS epoch.
+    ///
+    /// Discord clients compare this value out of band to confirm that every
+    /// participant reached the same group state. It changes on every epoch.
+    public func epochAuthenticator() throws -> Data? {
+        guard let session else {
+            throw DaveError.notConfigured
+        }
+        return session.lastEpochAuthenticator
+    }
+
     /// Gets decryption statistics for a remote user's audio decryptor, if one exists.
     public func decryptorStats(for userId: String) -> DaveDecryptorStats? {
         decryptors[userId]?.stats(mediaType: .audio)
@@ -852,15 +939,40 @@ public actor DaveSessionCoordinator {
     /// - Parameters:
     ///   - version: Fingerprint format version to use.
     ///   - userId: Discord user ID of the remote user.
-    public func pairwiseFingerprint(version: UInt16, userId: String) async throws -> Data? {
+    /// - Parameter timeout: How long to wait for the native callback before
+    ///   returning `nil`. The bundled implementation calls back synchronously,
+    ///   so this never fires in practice; it exists so a wedged or changed
+    ///   native implementation cannot suspend the caller forever.
+    public func pairwiseFingerprint(
+        version: UInt16,
+        userId: String,
+        timeout: Duration = .seconds(5)
+    ) async throws -> Data? {
         guard let session else {
             throw DaveError.notConfigured
         }
         try validateDiscordUserId(userId)
-        return await withCheckedContinuation { continuation in
-            session.getPairwiseFingerprint(version: version, userId: userId) { fingerprint in
-                continuation.resume(returning: fingerprint)
+
+        // The request is issued synchronously, so the non-`Sendable` session
+        // never crosses an isolation boundary. Only the single-shot bridge and
+        // resume box — both safe to share — are touched by the timeout task.
+        let resume = DaveSingleShotResume<Data?>()
+        let bridge = session.requestPairwiseFingerprint(version: version, userId: userId) { fingerprint in
+            resume.deliver(fingerprint)
+        }
+
+        let timeoutTask = Task {
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
             }
+            bridge.deliver(nil)
+        }
+        defer { timeoutTask.cancel() }
+
+        return await withCheckedContinuation { continuation in
+            resume.attach(continuation)
         }
     }
 
@@ -926,6 +1038,9 @@ public actor DaveSessionCoordinator {
         }
         try validateMlsPayload(proposals, kind: "proposals")
         try validateDiscordUserIds(recognizedUserIds)
+        // Discord supplies the expected participants here as well as with a
+        // Welcome; keep the verification baseline current either way.
+        recognizedRosterUserIds = Set(recognizedUserIds)
         guard let result = session.processProposals(proposals, recognizedUserIds: recognizedUserIds) else {
             throw DaveError.invalidState(message: "Proposals processing failed\(nativeFailureSuffix(session))")
         }
@@ -970,7 +1085,10 @@ public actor DaveSessionCoordinator {
             lastRecoveryAction: lastRecoveryAction,
             hasIssuedInitialKeyPackage: hasIssuedInitialKeyPackage,
             hasSentInitialKeyPackage: hasSentInitialKeyPackage,
-            pendingOutboundActionCount: pendingOutboundActionOrder.count
+            pendingOutboundActionCount: pendingOutboundActionOrder.count,
+            rosterMemberCount: rosterUserIds.count,
+            unrecognizedRosterMemberCount: unrecognizedRosterUserIds.count,
+            evictedTransitionCount: evictedTransitionCount
         )
     }
 
@@ -1110,6 +1228,79 @@ public actor DaveSessionCoordinator {
         lastTransitionTimestamp = Date()
     }
 
+    /// Internal snapshot of the invariants the state machine must never break,
+    /// so tests can assert them without reaching into individual fields.
+    internal struct InvariantSnapshot {
+        let mediaReady: Bool
+        let hasEncryptor: Bool
+        let hasActiveOutboundRatchet: Bool
+        let handshakeState: DaveHandshakeState
+        let ledgerEntryCount: Int
+        let stagedTransitionCount: Int
+        let stagedTransitionOrderCount: Int
+        let pendingOutboundActionCount: Int
+        let decryptorCount: Int
+    }
+
+    internal var invariantSnapshot: InvariantSnapshot {
+        InvariantSnapshot(
+            mediaReady: mediaReady,
+            hasEncryptor: encryptor != nil,
+            hasActiveOutboundRatchet: activeOutboundRatchet != nil,
+            handshakeState: handshakeState,
+            ledgerEntryCount: transitionLedger.count,
+            stagedTransitionCount: stagedTransitions.count,
+            stagedTransitionOrderCount: stagedTransitionOrder.count,
+            pendingOutboundActionCount: pendingOutboundActions.count,
+            decryptorCount: decryptors.count
+        )
+    }
+
+    /// Test-only accessor for the recognized-participant baseline that roster
+    /// verification compares against.
+    internal func setRecognizedRosterForTesting(_ userIds: [String]) {
+        recognizedRosterUserIds = Set(userIds)
+    }
+
+    /// Evidence for the serialization guarantee this type advertises.
+    ///
+    /// The dedicated serial executor is what keeps a blocking native MLS call
+    /// from starving the host's shared thread pool, and what serializes access
+    /// to native state that is not thread-safe. `ExecutorSerializationTests`
+    /// drives this concurrently and checks that the work never overlapped and
+    /// that no non-atomic update was lost.
+    internal struct ExecutorSerializationProbe {
+        var maxConcurrentEntries = 0
+        var nonAtomicCounter = 0
+        var ranOffDedicatedQueue = false
+        fileprivate var entriesInFlight = 0
+    }
+
+    private var executorProbe = ExecutorSerializationProbe()
+
+    internal func recordExecutorSerializationProbe(increments: Int) {
+        executorProbe.entriesInFlight += 1
+        executorProbe.maxConcurrentEntries = max(
+            executorProbe.maxConcurrentEntries,
+            executorProbe.entriesInFlight
+        )
+#if !DAVE_DEFAULT_ACTOR_EXECUTOR
+        if !executorQueue.label.isEmpty {
+            dispatchPrecondition(condition: .onQueue(executorQueue))
+        }
+#else
+        executorProbe.ranOffDedicatedQueue = true
+#endif
+        for _ in 0..<increments {
+            executorProbe.nonAtomicCounter += 1
+        }
+        executorProbe.entriesInFlight -= 1
+    }
+
+    internal func executorSerializationProbe() -> ExecutorSerializationProbe {
+        executorProbe
+    }
+
     // MARK: - Private Helpers
 
     private func processMlsTransition(_ transition: DiscordTransition) throws -> ProcessedMlsTransition {
@@ -1141,6 +1332,10 @@ public actor DaveSessionCoordinator {
             // Receivers prepare the new ratchets before Execute; the native
             // transition API retains prior receive context for in-flight media.
             try validateRosterCount(welcomeResult.rosterMemberIds.count)
+            recognizedRosterUserIds = Set(recognizedUserIds)
+            try applyRoster(welcomeResult.rosterMemberIds) {
+                welcomeResult.getRosterMemberSignature(rosterId: $0)
+            }
             synchronizeDecryptors(rosterMemberIds: welcomeResult.rosterMemberIds)
             appliedTransitionCount &+= 1
             handshakeState = .ready
@@ -1172,6 +1367,9 @@ public actor DaveSessionCoordinator {
                 try rebuildEncryptor()
             }
             try validateRosterCount(commitResult.rosterMemberIds.count)
+            try applyRoster(commitResult.rosterMemberIds) {
+                commitResult.getRosterMemberSignature(rosterId: $0)
+            }
             synchronizeDecryptors(rosterMemberIds: commitResult.rosterMemberIds)
             appliedTransitionCount &+= 1
             handshakeState = .ready
@@ -1198,14 +1396,12 @@ public actor DaveSessionCoordinator {
             return existing.executeSeen
         }
 
-        if !stagedTransitionOrder.contains(id),
-           stagedTransitionOrder.count >= limits.maximumTrackedTransitions {
-            failClosed(reason: "Exceeded the configured staged-transition limit")
-            throw DaveError.payloadTooLarge(
-                kind: "staged transition ledger",
-                maximum: limits.maximumTrackedTransitions,
-                actual: stagedTransitionOrder.count + 1
-            )
+        if !stagedTransitionOrder.contains(id) {
+            // Staged transitions are a *window* on to what Discord may execute
+            // next, not a permanent record. A long call legitimately produces
+            // more transitions than the window holds, so age the oldest out
+            // rather than killing a healthy session at an arbitrary count.
+            evictStagedTransitions(reserving: 1)
         }
 
         stagedTransitions[id] = StagedTransition(
@@ -1232,10 +1428,7 @@ public actor DaveSessionCoordinator {
             existing.executeSeen = true
             stagedTransitions[transitionId] = existing
         } else {
-            guard stagedTransitionOrder.count < limits.maximumTrackedTransitions else {
-                failClosed(reason: "Exceeded the configured staged-transition limit")
-                return
-            }
+            evictStagedTransitions(reserving: 1)
             stagedTransitions[transitionId] = StagedTransition(
                 transitionId: transitionId,
                 outboundRatchet: nil,
@@ -1312,12 +1505,36 @@ public actor DaveSessionCoordinator {
     }
 
     private func trimStagedTransitionsIfNeeded() {
-        // Capacity is checked before insertion. Keep this helper as a defensive
-        // backstop for future call sites rather than silently evicting state.
-        guard stagedTransitionOrder.count <= limits.maximumTrackedTransitions else {
-            failClosed(reason: "Exceeded the configured staged-transition limit")
-            return
+        evictStagedTransitions(reserving: 0)
+        refreshPendingTransitionID()
+    }
+
+    /// Drops the oldest staged transitions so that `reserving` more can be
+    /// added inside `maximumTrackedTransitions`.
+    ///
+    /// Discord executes transitions in order, so the oldest staged entry is the
+    /// one least likely to still be executed. Dropping it degrades gracefully:
+    /// if its Execute does arrive later it is treated as an Execute-before-MLS
+    /// signal, media stays paused, and the readiness watchdog still guards the
+    /// session. That is strictly better than the previous behavior, which
+    /// failed the whole voice session closed once the window filled up.
+    private func evictStagedTransitions(reserving additional: Int) {
+        var overflow = stagedTransitionOrder.count + additional - limits.maximumTrackedTransitions
+        guard overflow > 0 else { return }
+
+        var survivors: [UInt64] = []
+        survivors.reserveCapacity(stagedTransitionOrder.count)
+        for id in stagedTransitionOrder {
+            guard stagedTransitions[id] != nil else { continue }
+            if overflow > 0 {
+                stagedTransitions[id] = nil
+                overflow -= 1
+                evictedTransitionCount &+= 1
+                continue
+            }
+            survivors.append(id)
         }
+        stagedTransitionOrder = survivors
         refreshPendingTransitionID()
     }
 
@@ -1394,7 +1611,10 @@ public actor DaveSessionCoordinator {
 
     private func ensureTransitionLedgerCapacity(for key: String) throws {
         guard transitionLedger[key] == nil else { return }
+        evictTransitionLedgerEntries(reserving: 1)
         guard transitionLedger.count < limits.maximumTrackedTransitions else {
+            // Every entry is still pinned (unacknowledged outbound actions, or
+            // the live transition). That is a stalled host, not a long call.
             failClosed(reason: "Exceeded the configured transition replay-ledger limit")
             throw DaveError.payloadTooLarge(
                 kind: "transition replay ledger",
@@ -1402,6 +1622,50 @@ public actor DaveSessionCoordinator {
                 actual: transitionLedger.count + 1
             )
         }
+    }
+
+    /// Drops the oldest evictable replay-ledger entries so that `reserving`
+    /// more can be stored inside `maximumTrackedTransitions`.
+    ///
+    /// The ledger exists to make a gateway resume idempotent, which only
+    /// matters for recent events: a replay of something dozens of transitions
+    /// old is not something Discord does. Entries are therefore aged out
+    /// oldest-first, except for those that must not be forgotten yet:
+    ///
+    /// - entries whose outbound actions the host has not acknowledged, because
+    ///   it may still retry those exact bytes; and
+    /// - entries for the transition currently encrypting media, or for one
+    ///   still staged, because those are live state rather than history.
+    ///
+    /// Without this, a call simply accumulated entries until it hit the bound
+    /// and failed closed — roughly thirty membership changes, since each
+    /// transition stores both its commit/welcome and its execute.
+    private func evictTransitionLedgerEntries(reserving additional: Int) {
+        var overflow = transitionLedger.count + additional - limits.maximumTrackedTransitions
+        guard overflow > 0 else { return }
+
+        var survivors: [String] = []
+        survivors.reserveCapacity(transitionLedgerOrder.count)
+        for key in transitionLedgerOrder {
+            guard let entry = transitionLedger[key] else { continue }
+            if overflow > 0, !isLedgerEntryPinned(entry) {
+                transitionLedger[key] = nil
+                overflow -= 1
+                evictedTransitionCount &+= 1
+                continue
+            }
+            survivors.append(key)
+        }
+        transitionLedgerOrder = survivors
+    }
+
+    /// Whether a ledger entry is still live state rather than replay history.
+    private func isLedgerEntryPinned(_ entry: TransitionLedgerEntry) -> Bool {
+        if entry.outboundActionIDs.contains(where: { pendingOutboundActions[$0] != nil }) {
+            return true
+        }
+        guard let transitionId = entry.transitionId else { return false }
+        return transitionId == activeTransitionId || stagedTransitions[transitionId] != nil
     }
 
     private func markExecuteTransitionActivated(_ transitionId: UInt64) {
@@ -1444,6 +1708,7 @@ public actor DaveSessionCoordinator {
         recoveryHint: DaveRecoveryHint
     ) {
         if transitionLedger[key] == nil {
+            evictTransitionLedgerEntries(reserving: 1)
             guard transitionLedger.count < limits.maximumTrackedTransitions else {
                 failClosed(reason: "Exceeded the configured transition replay-ledger limit")
                 return
@@ -1494,7 +1759,9 @@ public actor DaveSessionCoordinator {
             pendingActions: envelopes,
             mediaReady: mediaReady,
             recoveryHint: fallback.recoveryHint,
-            diagnostics: getDiagnostics()
+            diagnostics: getDiagnostics(),
+            rosterUserIds: rosterUserIds,
+            unrecognizedRosterUserIds: unrecognizedRosterUserIds
         )
     }
 
@@ -1538,6 +1805,52 @@ public actor DaveSessionCoordinator {
         }
         decryptors[userId] = decryptor
         return decryptor
+    }
+
+    /// Records the roster an applied transition produced and checks it against
+    /// what the host said to expect.
+    ///
+    /// The roster is the group the client is actually encrypting to. A member
+    /// in it that the voice session never announced is the case end-to-end
+    /// encryption exists to surface, so it is always recorded and reported;
+    /// ``DaveRosterVerificationPolicy`` decides whether it also stops media.
+    ///
+    /// A roster is only checked once the host has supplied a recognized list
+    /// (Discord sends one with a Welcome). Before that — most importantly when
+    /// this client created the group itself — there is nothing to compare
+    /// against, and treating every member as unrecognized would be noise.
+    internal func applyRoster(
+        _ rosterMemberIds: [UInt64],
+        signature: @Sendable (UInt64) -> Data?
+    ) throws {
+        rosterUserIds = rosterMemberIds.map(String.init)
+
+        var signatures: [String: Data] = [:]
+        signatures.reserveCapacity(rosterMemberIds.count)
+        for memberId in rosterMemberIds {
+            if let signature = signature(memberId) {
+                signatures[String(memberId)] = signature
+            }
+        }
+        rosterMemberSignatures = signatures
+
+        guard !recognizedRosterUserIds.isEmpty else {
+            unrecognizedRosterUserIds = []
+            return
+        }
+
+        // The local client is always a legitimate member of its own group,
+        // whether or not it appears in the list Discord supplied.
+        var expected = recognizedRosterUserIds
+        if let selfUserId {
+            expected.insert(selfUserId)
+        }
+        unrecognizedRosterUserIds = rosterUserIds.filter { !expected.contains($0) }
+
+        guard !unrecognizedRosterUserIds.isEmpty else { return }
+        if limits.unrecognizedRosterMemberPolicy == .failClosed {
+            throw DaveError.unrecognizedRosterMembers(userIds: unrecognizedRosterUserIds)
+        }
     }
 
     /// Brings per-user decryptors in step with the roster after an applied
@@ -1611,6 +1924,9 @@ public actor DaveSessionCoordinator {
         pendingEpoch = nil
         pendingTransitionId = nil
         pendingProtocolVersion = nil
+        rosterUserIds.removeAll()
+        rosterMemberSignatures.removeAll()
+        unrecognizedRosterUserIds.removeAll()
         clearMediaReadinessWatchdog()
         handshakeState = .failed
         lastMlsError = reason
@@ -1663,7 +1979,9 @@ public actor DaveSessionCoordinator {
             outboundActions: actions,
             mediaReady: mediaReady,
             recoveryHint: recoveryHint,
-            diagnostics: getDiagnostics()
+            diagnostics: getDiagnostics(),
+            rosterUserIds: rosterUserIds,
+            unrecognizedRosterUserIds: unrecognizedRosterUserIds
         )
     }
 
@@ -1671,18 +1989,20 @@ public actor DaveSessionCoordinator {
         mediaReadinessWatchdogTask?.cancel()
         mediaReadinessWatchdogTask = nil
         mediaReadinessWatchdogStartedAt = nil
-        mediaReadinessWatchdogTimeout = 10
+        mediaReadinessWatchdogStartedDate = nil
+        mediaReadinessWatchdogTimeout = limits.mediaReadinessTimeout
         mediaReadinessWatchdogReason = nil
     }
 
     /// Keeps media paused after installing a new ratchet until Discord confirms
     /// the matching Execute Transition. Preserve an existing watchdog (which
     /// carries the transition ID supplied by the high-level gateway helper).
-    private func beginMediaReadinessWait(reason: String, timeout: TimeInterval = 10) {
+    private func beginMediaReadinessWait(reason: String, timeout: TimeInterval? = nil) {
         mediaReady = false
         if mediaReadinessWatchdogStartedAt == nil {
-            mediaReadinessWatchdogStartedAt = Date()
-            mediaReadinessWatchdogTimeout = max(0, timeout)
+            mediaReadinessWatchdogStartedAt = .now
+            mediaReadinessWatchdogStartedDate = Date()
+            mediaReadinessWatchdogTimeout = max(0, timeout ?? limits.mediaReadinessTimeout)
             mediaReadinessWatchdogReason = reason
             scheduleMediaReadinessWatchdog()
         }
@@ -1722,7 +2042,13 @@ public actor DaveSessionCoordinator {
         }
     }
 
-    private func expireMediaReadinessWatchdog(sessionGeneration: UInt64, startedAt: Date) {
+    /// Converts a `Duration` to seconds without losing sub-second precision.
+    private static func seconds(_ duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) * 1e-18
+    }
+
+    private func expireMediaReadinessWatchdog(sessionGeneration: UInt64, startedAt: ContinuousClock.Instant) {
         guard sessionGeneration == self.sessionGeneration,
               mediaReadinessWatchdogStartedAt == startedAt,
               case .timedOut(let reason, _) = evaluateMediaReadinessWatchdog() else {

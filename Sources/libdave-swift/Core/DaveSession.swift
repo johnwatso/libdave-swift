@@ -18,6 +18,59 @@ public final class DaveKeyRatchet: @unchecked Sendable {
     }
 }
 
+/// Holds key ratchets that have been replaced but that native code may still
+/// read from.
+///
+/// `dave.h` documents that `daveEncryptorSetKeyRatchet` and
+/// `daveDecryptorTransitionToKeyRatchet` do **not** take ownership of the
+/// handle they are given. libdave's decryptor also keeps decrypting with the
+/// previous epoch's ratchet for a short transition window, so that frames
+/// already in flight when a re-key lands are not dropped. Releasing the
+/// replaced Swift wrapper immediately would call `daveKeyRatchetDestroy` on a
+/// handle the native side can still dereference during that window.
+///
+/// Replaced ratchets are therefore parked here and released only once the
+/// window has comfortably passed. The cost is a handful of small native
+/// objects held for a few extra seconds per re-key.
+internal enum DaveRetiredHandlePoolLimits {
+    /// libdave expires a media transition on the order of ten seconds. Hold
+    /// well past that so a late frame can never reach a freed ratchet.
+    static let grace: Duration = .seconds(30)
+    /// Ceiling for pathological re-key storms. Re-keys are seconds apart in
+    /// practice, so this is never reached by normal Discord traffic.
+    static let maximumRetained = 8
+}
+
+internal struct DaveRetiredHandlePool<Element: AnyObject> {
+
+    private var retired: [(element: Element, retiredAt: ContinuousClock.Instant)] = []
+
+    /// Parks a replaced ratchet, first releasing any whose window has passed.
+    mutating func retire(_ ratchet: Element) {
+        prune()
+        retired.append((ratchet, ContinuousClock.now))
+        if retired.count > DaveRetiredHandlePoolLimits.maximumRetained {
+            retired.removeFirst(retired.count - DaveRetiredHandlePoolLimits.maximumRetained)
+        }
+    }
+
+    /// Releases ratchets whose transition window has elapsed. Uses a monotonic
+    /// clock so a wall-clock adjustment cannot free one early.
+    mutating func prune() {
+        guard !retired.isEmpty else { return }
+        let now = ContinuousClock.now
+        retired.removeAll { now - $0.retiredAt >= DaveRetiredHandlePoolLimits.grace }
+    }
+
+    /// Number of ratchets currently parked. Exposed for tests.
+    var count: Int { retired.count }
+}
+
+/// The pool as used by the media cryptors. It is generic only so its bounding
+/// behavior can be tested without an established MLS group, which is the one
+/// thing that can produce a real ratchet handle.
+internal typealias DaveRetiredRatchetPool = DaveRetiredHandlePool<DaveKeyRatchet>
+
 /// Opaque wrapper for the result of an MLS commit process.
 public final class DaveCommitResult: @unchecked Sendable {
     internal let handle: DAVECommitResultHandle?
@@ -126,6 +179,12 @@ public final class DaveSession {
     ///   - authSessionId: Identifier used to manage persistent key lifetimes.
     ///   - onMLSFailure: Callback invoked when an MLS failure occurs.
     public init(authSessionId: String? = nil, onMLSFailure: @escaping @Sendable (String, String) -> Void) throws {
+        // The native backend interpolates this id into a key-store filename.
+        // Validate before it can escape the identity directory.
+        if let authSessionId {
+            try DavePersistedIdentityStore.validate(authSessionId: authSessionId)
+        }
+
         let bridge = DaveSessionCallbackBridge()
         bridge.onMLSFailure = onMLSFailure
         // Keep the raw callback context valid even if the native library
@@ -144,13 +203,21 @@ public final class DaveSession {
 
         self.handle = handle
         self.callbackBridge = bridge
+
+        if authSessionId != nil {
+            // Native code creates the key file 0600 but leaves the directory
+            // world-readable. Tighten it as soon as it can exist.
+            DavePersistedIdentityStore.hardenStoragePermissions()
+        }
     }
 
     deinit {
         // The native C API has no documented callback drain. Deactivate first
         // so any callback concurrent with or following destruction is inert;
-        // the bridge remains retained by DaveNativeCallbackContextRetainer.
+        // the bridge is then retired, which keeps it allocated for a grace
+        // window before DaveNativeCallbackContextRetainer reclaims it.
         callbackBridge.deactivate()
+        DaveNativeCallbackContextRetainer.shared.retireAfterNativeLifetime(callbackBridge)
         daveSessionDestroy(handle)
     }
 
@@ -197,7 +264,22 @@ public final class DaveSession {
     }
 
     /// Sets the external sender credentials.
+    ///
+    /// An empty payload is rejected here rather than forwarded: the native
+    /// unmarshaller reads the buffer without checking its length and crashes
+    /// the process on zero bytes. Checking `baseAddress` for `nil` is not a
+    /// sufficient guard, because empty `Data` may still vend a non-`nil`
+    /// pointer. The rejection is recorded as an MLS failure so it surfaces
+    /// through ``takeLastMLSFailure()`` on the usual path.
     public func setExternalSender(_ externalSender: Data) {
+        guard !externalSender.isEmpty else {
+            callbackBridge.recordFailure(
+                source: "libdave-swift",
+                reason: "External sender payload was empty"
+            )
+            return
+        }
+
         externalSender.withUnsafeBytes { rawBuffer in
             if let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) {
                 daveSessionSetExternalSender(handle, baseAddress, externalSender.count)
@@ -206,7 +288,12 @@ public final class DaveSession {
     }
 
     /// Processes MLS proposals and generates commit/welcome messages.
+    ///
+    /// Returns `nil` for an empty payload rather than forwarding it: see the
+    /// note on ``setExternalSender(_:)`` for why zero-length buffers are not
+    /// handed to native code.
     public func processProposals(_ proposals: Data, recognizedUserIds: [String]) -> Data? {
+        guard !proposals.isEmpty else { return nil }
         var outputPtr: UnsafeMutablePointer<UInt8>? = nil
         var outputLength: Int = 0
 
@@ -240,7 +327,10 @@ public final class DaveSession {
     }
 
     /// Processes an incoming MLS commit message.
+    ///
+    /// An empty payload yields a failed result without entering native code.
     public func processCommit(_ commit: Data) -> DaveCommitResult {
+        guard !commit.isEmpty else { return DaveCommitResult(handle: nil) }
         let resultHandle = commit.withUnsafeBytes { commitBuffer -> DAVECommitResultHandle? in
             let commitPtr = commitBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self)
             return daveSessionProcessCommit(handle, commitPtr, commit.count)
@@ -249,7 +339,10 @@ public final class DaveSession {
     }
 
     /// Processes an incoming MLS welcome message to join a group.
+    ///
+    /// Returns `nil` for an empty payload without entering native code.
     public func processWelcome(_ welcome: Data, recognizedUserIds: [String]) -> DaveWelcomeResult? {
+        guard !welcome.isEmpty else { return nil }
         let cStrings = recognizedUserIds.map { strdup($0) }
         defer {
             for ptr in cStrings {
@@ -306,9 +399,26 @@ public final class DaveSession {
         userId: String,
         callback: @escaping @Sendable (Data?) -> Void
     ) {
+        _ = requestPairwiseFingerprint(version: version, userId: userId, callback: callback)
+    }
+
+    /// Issues one fingerprint request and returns its single-shot bridge, so an
+    /// `async` caller can also complete it from a timeout path.
+    ///
+    /// This stays synchronous on purpose: callers that hold a `DaveSession`
+    /// inside an actor can issue the request without sending the (deliberately
+    /// non-`Sendable`) session across an isolation boundary, and then await the
+    /// returned bridge, which is safe to share.
+    @discardableResult
+    internal func requestPairwiseFingerprint(
+        version: UInt16,
+        userId: String,
+        callback: @escaping @Sendable (Data?) -> Void
+    ) -> DaveFingerprintCallbackBridge {
         // Dedicated per-call bridge: concurrent requests cannot clobber one
         // another's closure. Keep its raw callback context valid even if the
-        // native implementation ever changes its callback timing.
+        // native implementation ever changes its callback timing; the bridge
+        // retires itself once the one expected callback has been consumed.
         let bridge = DaveFingerprintCallbackBridge(callback: callback)
         DaveNativeCallbackContextRetainer.shared.retainForNativeLifetime(bridge)
         let bridgePtr = Unmanaged.passUnretained(bridge).toOpaque()
@@ -321,17 +431,43 @@ public final class DaveSession {
                 bridgePtr
             )
         }
+        return bridge
     }
 
     /// Async variant of ``getPairwiseFingerprint(version:userId:callback:)``.
     ///
     /// Returns `nil` when the native library produced no fingerprint (e.g. the
-    /// remote user is not in the current MLS group).
-    public func pairwiseFingerprint(version: UInt16, userId: String) async -> Data? {
-        await withCheckedContinuation { continuation in
-            getPairwiseFingerprint(version: version, userId: userId) { fingerprint in
-                continuation.resume(returning: fingerprint)
+    /// remote user is not in the current MLS group), and also when the native
+    /// callback does not arrive within `timeout`.
+    ///
+    /// The bundled implementation calls back synchronously, so the timeout
+    /// never fires in practice. It exists so that a future native change (or a
+    /// wedged native call) degrades to a `nil` answer instead of suspending the
+    /// caller forever and leaking its callback context.
+    public func pairwiseFingerprint(
+        version: UInt16,
+        userId: String,
+        timeout: Duration = .seconds(5)
+    ) async -> Data? {
+        let resume = DaveSingleShotResume<Data?>()
+        let bridge = requestPairwiseFingerprint(version: version, userId: userId) { fingerprint in
+            resume.deliver(fingerprint)
+        }
+
+        let timeoutTask = Task {
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
             }
+            // Completes the bridge as well, so its callback context stops being
+            // retained even though native code never delivered.
+            bridge.deliver(nil)
+        }
+        defer { timeoutTask.cancel() }
+
+        return await withCheckedContinuation { continuation in
+            resume.attach(continuation)
         }
     }
 }

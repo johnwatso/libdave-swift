@@ -13,6 +13,11 @@ public final class DaveDecryptor {
     // `daveDecryptorTransitionToKeyRatchet` borrows this handle; it does not
     // take ownership. Retain the wrapper for the lifetime of the assignment.
     private var keyRatchet: DaveKeyRatchet?
+    // A transition does not discard the previous ratchet immediately: native
+    // code keeps using it to decrypt frames that were already in flight when
+    // the re-key landed. Park replaced ratchets so that window cannot read a
+    // destroyed handle.
+    private var retiredRatchets = DaveRetiredRatchetPool()
 
     /// Creates a new media frame decryptor.
     public init() throws {
@@ -27,7 +32,14 @@ public final class DaveDecryptor {
     }
 
     /// Transitions the decryptor to use a new key ratchet.
+    ///
+    /// The previously installed ratchet stays allocated for a grace window,
+    /// because the native decryptor continues to use it for frames from the
+    /// prior epoch until its transition expires.
     public func transitionToKeyRatchet(_ keyRatchet: DaveKeyRatchet) {
+        if let previous = self.keyRatchet, previous !== keyRatchet {
+            retiredRatchets.retire(previous)
+        }
         self.keyRatchet = keyRatchet
         daveDecryptorTransitionToKeyRatchet(handle, keyRatchet.handle)
     }
@@ -51,6 +63,9 @@ public final class DaveDecryptor {
     ///   - encryptedFrame: The encrypted frame bytes.
     /// - Returns: The decrypted plaintext frame bytes.
     public func decrypt(mediaType: DaveMediaType, encryptedFrame: Data) throws -> Data {
+        // Cheap no-op unless a recent transition parked a ratchet; this is what
+        // releases them once their window has passed on a steady media path.
+        retiredRatchets.prune()
         let maxCapacity = maxPlaintextByteSize(mediaType: mediaType, encryptedFrameSize: encryptedFrame.count)
         var plaintextData = Data(count: maxCapacity)
         var bytesWritten: Int = 0
