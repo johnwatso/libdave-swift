@@ -1,0 +1,59 @@
+Format reference for MLS integration fixtures. Copy to `<name>.json` and fill
+in with bytes captured from a disposable, non-production Voice session.
+
+Only `.json` files in this directory are executed, so this reference file is
+inert.
+
+{
+  "description": "join an established group, re-key, and round-trip audio",
+  "groupId": 1,
+  "selfUserId": "424242424242424242",
+  "protocolVersion": 1,
+  "steps": [
+    {
+      "event": "externalSender",
+      "payloadHex": "<serialized external sender>",
+      "expect": { "actions": ["mlsKeyPackage"] }
+    },
+    {
+      "event": "welcome",
+      "payloadHex": "<serialized MLS welcome>",
+      "transitionId": 2,
+      "recognizedUserIds": ["424242424242424242", "515151515151515151"],
+      "expect": {
+        "actions": ["transitionReady"],
+        "mediaReady": false,
+        "roster": ["424242424242424242", "515151515151515151"],
+        "unrecognizedRoster": []
+      }
+    },
+    {
+      "event": "executeTransition",
+      "transitionId": 2,
+      "expect": { "mediaReady": true }
+    },
+    {
+      "event": "encryptAudio",
+      "payloadHex": "<opus frame>",
+      "ssrc": 42,
+      "expect": { "differsFromPlaintext": true }
+    },
+    {
+      "event": "decryptAudio",
+      "payloadHex": "<encrypted frame from the remote speaker>",
+      "fromUserId": "515151515151515151",
+      "expect": { "plaintextHex": "<expected opus frame>" }
+    },
+    {
+      "event": "commit",
+      "payloadHex": "<serialized MLS commit for the next epoch>",
+      "transitionId": 3,
+      "expect": { "actions": ["transitionReady"], "mediaReady": false }
+    },
+    {
+      "event": "executeTransition",
+      "transitionId": 3,
+      "expect": { "mediaReady": true }
+    }
+  ]
+}

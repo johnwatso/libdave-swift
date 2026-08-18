@@ -1,0 +1,20 @@
+{
+  "description": "Self-check for the fixture harness itself. Uses deliberately malformed MLS bytes, so it needs no captured session and no secret material. It keeps the harness's discovery, decoding, event construction, and assertion paths exercised on every run, so that a real captured fixture drops into a harness that is known to work rather than one that has silently rotted. It does NOT verify any real MLS behaviour.",
+  "groupId": 667788,
+  "selfUserId": "667788",
+  "protocolVersion": 1,
+  "steps": [
+    {
+      "event": "externalSender",
+      "payloadHex": "0102030405",
+      "expect": { "error": "externalSenderRejected" }
+    },
+    {
+      "event": "prepareEpoch",
+      "protocolVersion": 1,
+      "epoch": 2,
+      "transitionId": 98,
+      "expect": { "error": "sessionFailed" }
+    }
+  ]
+}
