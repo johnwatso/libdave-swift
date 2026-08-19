@@ -170,7 +170,7 @@ public enum DaveRosterVerificationPolicy: String, Codable, Sendable {
 /// preventing a malformed gateway payload from turning into an unbounded
 /// allocation or native parse attempt. Hosts with a known smaller deployment
 /// may lower them further.
-public struct DaveCoordinatorLimits: Sendable, Equatable {
+public struct DaveCoordinatorLimits: Sendable, Equatable, Codable {
     public var maximumMlsPayloadBytes: Int
     public var maximumRosterMembers: Int
     public var maximumMediaFrameBytes: Int
@@ -182,6 +182,14 @@ public struct DaveCoordinatorLimits: Sendable, Equatable {
     public var mediaReadinessTimeout: TimeInterval
     /// How an MLS roster member the host never recognized is handled.
     public var unrecognizedRosterMemberPolicy: DaveRosterVerificationPolicy
+    /// State-machine events kept in the bounded diagnostic trace reported by
+    /// ``DaveDiagnostics/recentEvents``. Older events are dropped first.
+    public var traceEventCapacity: Int
+    /// Events buffered per live subscriber of
+    /// ``DaveSessionCoordinator/diagnosticEvents(bufferSize:)`` before the
+    /// oldest are dropped. A slow consumer degrades its own stream rather than
+    /// growing memory or stalling the coordinator.
+    public var diagnosticEventBufferSize: Int
 
     public init(
         maximumMlsPayloadBytes: Int = 1_048_576,
@@ -190,7 +198,9 @@ public struct DaveCoordinatorLimits: Sendable, Equatable {
         maximumTrackedTransitions: Int = 64,
         maximumPendingOutboundActions: Int = 64,
         mediaReadinessTimeout: TimeInterval = 10,
-        unrecognizedRosterMemberPolicy: DaveRosterVerificationPolicy = .report
+        unrecognizedRosterMemberPolicy: DaveRosterVerificationPolicy = .report,
+        traceEventCapacity: Int = 200,
+        diagnosticEventBufferSize: Int = 256
     ) {
         self.maximumMlsPayloadBytes = max(1, maximumMlsPayloadBytes)
         self.maximumRosterMembers = max(1, maximumRosterMembers)
@@ -199,18 +209,31 @@ public struct DaveCoordinatorLimits: Sendable, Equatable {
         self.maximumPendingOutboundActions = max(1, maximumPendingOutboundActions)
         self.mediaReadinessTimeout = max(0, mediaReadinessTimeout)
         self.unrecognizedRosterMemberPolicy = unrecognizedRosterMemberPolicy
+        // A trace is a diagnostic aid, never a reason to grow without bound.
+        self.traceEventCapacity = min(max(0, traceEventCapacity), 2_000)
+        self.diagnosticEventBufferSize = min(max(1, diagnosticEventBufferSize), 4_096)
     }
 
     public static let `default` = DaveCoordinatorLimits()
 }
 
-/// Coarse lifecycle state for Discord's MLS external sender package.
+/// Lifecycle state for Discord's MLS external sender package.
+///
+/// > Note: There is deliberately no `accepted` case. `daveSessionSetExternalSender`
+/// > returns `void`, and the bundled C API exposes no query for whether a
+/// > pending MLS group was created, so acceptance is not observable — only
+/// > rejection is, through the native failure callback. Claiming `accepted`
+/// > would be asserting something this library cannot check. If the native API
+/// > later reports parse success, a case can be added without disturbing these.
 public enum DaveExternalSenderState: String, Codable, Sendable {
+    /// No external sender has been submitted for this session generation.
     case missing
-    /// Non-empty sender bytes were submitted to the current native session.
-    /// The bundled C API does not expose parse success, so this is not proof
-    /// that native MLS accepted the payload.
-    case registered
+    /// Non-empty sender bytes were handed to native MLS and no failure was
+    /// reported. This is *not* proof that native MLS accepted the payload.
+    case submitted
+    /// Native MLS reported a failure for the submitted sender. The session is
+    /// failed closed; recreate it before submitting another.
+    case rejected
 }
 
 /// Last meaningful recovery or state-machine action performed by the coordinator.
@@ -445,6 +468,63 @@ public enum DaveError: Error, LocalizedError, Sendable {
             return "Invalid auth session ID: '\(authSessionId)'. It is used as a key-store filename, so it must be non-empty, at most 128 UTF-8 bytes, and free of path separators, '..', and control characters."
         case .unrecognizedRosterMembers(let userIds):
             return "The MLS roster contains \(userIds.count) member(s) the voice session never recognized: \(userIds.joined(separator: ", "))."
+        }
+    }
+
+    /// Machine-readable classification, for callers that branch on failures
+    /// rather than parsing `localizedDescription`.
+    public var failureCode: DaveFailureCode {
+        switch self {
+        case .sessionCreationFailed, .encryptorCreationFailed, .decryptorCreationFailed:
+            return .encryptorUnavailable
+        case .handshakeFailed:
+            return .commitProcessingFailed
+        case .protocolMismatch, .unsupportedProtocolVersion:
+            return .protocolVersionRejected
+        case .invalidTransition:
+            return .invalidPayload
+        case .ratchetFailed:
+            return .keyRatchetUnavailable
+        case .encryptionFailed, .decryptionFailed:
+            return .keyRatchetUnavailable
+        case .bufferTooSmall:
+            return .invalidPayload
+        case .invalidState:
+            return .unknown
+        case .mediaNotReady:
+            return .keyRatchetUnavailable
+        case .invalidExternalSender:
+            return .invalidPayload
+        case .externalSenderRejected:
+            return .externalSenderRejected
+        case .externalSenderRequired:
+            return .externalSenderMissing
+        case .externalSenderConflict:
+            return .externalSenderConflict
+        case .invalidDiscordUserId, .invalidDiscordGroupId, .invalidAuthSessionId:
+            return .invalidPayload
+        case .transitionConflict:
+            return .transitionConflict
+        case .payloadTooLarge, .invalidMediaFrameSize:
+            return .resourceLimitExceeded
+        case .sessionFailed:
+            return .nativeMlsFailure
+        case .notConfigured:
+            return .unknown
+        case .unrecognizedRosterMembers:
+            return .unrecognizedRosterMembers
+        }
+    }
+
+    /// Where the failure came from.
+    public var failureOrigin: DaveFailureOrigin {
+        switch self {
+        case .handshakeFailed, .externalSenderRejected, .sessionFailed, .ratchetFailed:
+            return .nativeMls
+        case .unrecognizedRosterMembers:
+            return .policy
+        default:
+            return .wrapper
         }
     }
 

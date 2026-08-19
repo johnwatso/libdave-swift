@@ -155,6 +155,23 @@ public actor DaveSessionCoordinator {
     private var recognizedRosterUserIds: Set<String> = []
     /// Roster members absent from `recognizedRosterUserIds`.
     private var unrecognizedRosterUserIds: [String] = []
+
+    /// Monotonic sequence for diagnostic events, so a host can order them and
+    /// detect a gap without relying on timestamp resolution.
+    private var diagnosticEventSequence: UInt64 = 0
+    /// Bounded trace of recent state-machine events.
+    ///
+    /// It deliberately survives `reset()` and recovery: the events explaining
+    /// *why* a session was recreated are the ones a post-mortem needs, and each
+    /// event carries the session generation it belongs to. It holds no MLS
+    /// payloads, ratchets, or key material — only classifications and sizes.
+    private var traceEvents: [DaveDiagnosticEvent] = []
+    /// Live subscribers. Each has its own bounded buffer, so a slow consumer
+    /// degrades only its own stream.
+    private var eventSubscribers: [UUID: AsyncStream<DaveDiagnosticEvent>.Continuation] = [:]
+    /// Most recent structured failure, for hosts that branch on codes rather
+    /// than parsing `lastMlsError`.
+    private var lastFailureReport: DaveFailureReport?
     /// Opcode 21 with transition ID zero is Discord's sole-member-reset
     /// signal. It immediately executes the new *pending* local group, which
     /// is intentionally not media-ready until native MLS later establishes a
@@ -185,6 +202,7 @@ public actor DaveSessionCoordinator {
         self.protocolVersion = protocolVersion
 
         try recreateSessionState()
+        emit(.sessionConfigured, outcome: .observed, detail: "group \(groupId), protocol \(protocolVersion)")
     }
 
     /// Configures a Discord Voice DAVE session and returns the first high-level
@@ -235,11 +253,12 @@ public actor DaveSessionCoordinator {
         isExternalSenderRegistered = false
         externalSenderState = .missing
         externalSenderData = nil
-        mediaReady = false
+        setMediaReady(false, reason: "session reset")
         pendingEpoch = nil
         pendingTransitionId = nil
         pendingProtocolVersion = nil
         lastRecoveryAction = .reset
+        emit(.sessionReset, outcome: .observed, detail: "state cleared")
         hasIssuedInitialKeyPackage = false
         hasSentInitialKeyPackage = false
         soleMemberResetExecuteSeen = false
@@ -258,6 +277,7 @@ public actor DaveSessionCoordinator {
             try initializeSession(groupId: groupId, selfUserId: selfUserId)
         }
         lastRecoveryAction = .recreateSession
+        emit(.recoveryPerformed, outcome: .observed, detail: "session recreated")
     }
 
     /// Rebuilds only the encryptor, preserving session state but invalidating existing ratchets.
@@ -343,7 +363,7 @@ public actor DaveSessionCoordinator {
     @discardableResult
     public func publishDiscordInitialKeyPackage() throws -> DiscordDaveTransitionResult {
         var actions: [DiscordDaveOutboundAction] = []
-        guard externalSenderState == .registered else {
+        guard externalSenderState == .submitted else {
             throw DaveError.externalSenderRequired
         }
         if let keyPackageAction = try makeInitialKeyPackageActionIfNeeded(requireExternalSender: true) {
@@ -606,7 +626,7 @@ public actor DaveSessionCoordinator {
         }
 
         soleMemberResetExecuteSeen = true
-        mediaReady = false
+        setMediaReady(false, reason: "sole-member reset executed; no usable ratchet yet")
         // The Epoch-1 Prepare transition is now semantically executed. It is
         // not an MLS readiness deadline: a solo client can legitimately remain
         // pending until another member joins and produces the first commit.
@@ -688,6 +708,12 @@ public actor DaveSessionCoordinator {
                 }
                 lastRecoveryAction = .prepareProtocolVersion
                 lastTransitionTimestamp = Date()
+                emit(
+                    .epochPrepared,
+                    outcome: .staged,
+                    transitionId: transitionId,
+                    detail: "epoch \(epoch), protocol \(protocolVersion)"
+                )
                 return makeDiscordResult(actions: [.transitionReady(transitionId)])
             } catch {
                 failClosed(reason: "Prepare Epoch \(epoch) failed: \(error.localizedDescription)")
@@ -749,6 +775,13 @@ public actor DaveSessionCoordinator {
             timeout: timeout
         )
         lastRecoveryAction = .invalidTransitionRecovery
+        emit(
+            .recoveryPerformed,
+            outcome: .observed,
+            transitionId: transitionId,
+            recoveryHint: .sendInvalidCommitWelcome,
+            detail: "invalid commit/welcome recovery"
+        )
 
         return makeDiscordResult(
             actions: actions,
@@ -768,7 +801,7 @@ public actor DaveSessionCoordinator {
         guard handshakeState != .failed else {
             return .timedOut(reason: "DAVE session failed closed", recoveryHint: .recreateSession)
         }
-        mediaReady = false
+        setMediaReady(false, reason: reason)
         // A generic pause must not retain an unrelated old ID: otherwise a
         // later valid Execute can be rejected forever as a false mismatch.
         self.pendingTransitionId = pendingTransitionId
@@ -780,6 +813,12 @@ public actor DaveSessionCoordinator {
         lastRecoveryAction = .pauseMedia
         lastTransitionTimestamp = Date()
         scheduleMediaReadinessWatchdog()
+        emit(
+            .watchdogStarted,
+            outcome: .observed,
+            transitionId: pendingTransitionId,
+            detail: reason
+        )
         return evaluateMediaReadinessWatchdog()
     }
 
@@ -800,7 +839,7 @@ public actor DaveSessionCoordinator {
         guard pendingTransitionId == nil, stagedTransitions.isEmpty else {
             return evaluateMediaReadinessWatchdog()
         }
-        mediaReady = true
+        setMediaReady(true, reason: reason ?? "host marked media ready")
         pendingEpoch = nil
         pendingTransitionId = nil
         lastRecoveryAction = .resumeMedia
@@ -993,7 +1032,11 @@ public actor DaveSessionCoordinator {
 
         if let current = externalSenderData {
             guard current == externalSender else {
-                failClosed(reason: "Conflicting external sender payload")
+                failClosed(
+                    reason: "Conflicting external sender payload",
+                    code: .externalSenderConflict,
+                    origin: .wrapper
+                )
                 throw DaveError.externalSenderConflict
             }
             // Replayed external-sender events are already represented in the
@@ -1004,14 +1047,34 @@ public actor DaveSessionCoordinator {
         session.setExternalSender(externalSender)
         if let failure = session.takeLastMLSFailure() {
             let reason = "\(failure.source): \(failure.reason)"
-            failClosed(reason: "External sender rejected by native MLS: \(reason)")
+            externalSenderState = .rejected
+            isExternalSenderRegistered = false
+            emit(
+                .externalSenderSubmitted,
+                outcome: .rejected,
+                payloadByteCount: externalSender.count,
+                detail: failure.source
+            )
+            failClosed(
+                reason: "External sender rejected by native MLS: \(reason)",
+                code: .externalSenderRejected,
+                origin: .nativeMls,
+                nativeSource: failure.source,
+                nativeReason: failure.reason
+            )
             throw DaveError.externalSenderRejected(reason: reason)
         }
         isExternalSenderRegistered = true
-        externalSenderState = .registered
+        externalSenderState = .submitted
         externalSenderData = externalSender
         lastRecoveryAction = .registerExternalSender
         lastTransitionTimestamp = Date()
+        emit(
+            .externalSenderSubmitted,
+            outcome: .applied,
+            payloadByteCount: externalSender.count,
+            detail: "submitted; native MLS reports no parse status"
+        )
     }
 
     /// Gets the marshalled MLS key package.
@@ -1047,6 +1110,7 @@ public actor DaveSessionCoordinator {
         try validateMlsPayload(result, kind: "commit/welcome")
         lastRecoveryAction = .processProposals
         lastTransitionTimestamp = Date()
+        emit(.proposalsProcessed, outcome: .applied, payloadByteCount: proposals.count)
         return result
     }
 
@@ -1102,6 +1166,14 @@ public actor DaveSessionCoordinator {
     public func consumeDiscordGatewayEvent(_ event: DiscordDaveGatewayEvent) throws -> DiscordDaveGatewayResult {
         let result: DiscordDaveTransitionResult
         let key: String
+
+        emit(
+            .gatewayEventReceived,
+            outcome: .observed,
+            transitionId: Self.transitionId(of: event),
+            payloadByteCount: Self.payloadByteCount(of: event),
+            detail: Self.name(of: event)
+        )
 
         switch event {
         case .externalSender(let sender):
@@ -1209,6 +1281,39 @@ public actor DaveSessionCoordinator {
         return makeGatewayResult(for: key, fallback: result)
     }
 
+    /// Event kind name for the trace. Carries no payload bytes.
+    private static func name(of event: DiscordDaveGatewayEvent) -> String {
+        switch event {
+        case .externalSender: return "externalSender"
+        case .proposals: return "proposals"
+        case .welcome: return "welcome"
+        case .commit: return "commit"
+        case .executeTransition: return "executeTransition"
+        case .prepareEpoch: return "prepareEpoch"
+        }
+    }
+
+    private static func transitionId(of event: DiscordDaveGatewayEvent) -> UInt64? {
+        switch event {
+        case .externalSender, .proposals: return nil
+        case .welcome(_, let transitionId, _): return transitionId
+        case .commit(_, let transitionId): return transitionId
+        case .executeTransition(let transitionId): return transitionId
+        case .prepareEpoch(_, _, let transitionId): return transitionId
+        }
+    }
+
+    /// Size only: the trace never retains gateway payload bytes.
+    private static func payloadByteCount(of event: DiscordDaveGatewayEvent) -> Int? {
+        switch event {
+        case .externalSender(let payload): return payload.count
+        case .proposals(let payload, _): return payload.count
+        case .welcome(let payload, _, _): return payload.count
+        case .commit(let payload, _): return payload.count
+        case .executeTransition, .prepareEpoch: return nil
+        }
+    }
+
     /// Returns undelivered gateway actions in deterministic send order.
     public func pendingDiscordGatewayActions() -> [DiscordDaveOutboundActionEnvelope] {
         pendingOutboundActionOrder.compactMap { id in
@@ -1226,6 +1331,7 @@ public actor DaveSessionCoordinator {
         }
         lastRecoveryAction = .acknowledgeOutboundAction
         lastTransitionTimestamp = Date()
+        emit(.outboundActionAcknowledged, outcome: .observed, acknowledgedOutboundActionId: id)
     }
 
     /// Internal snapshot of the invariants the state machine must never break,
@@ -1301,6 +1407,115 @@ public actor DaveSessionCoordinator {
         executorProbe
     }
 
+    // MARK: - Diagnostic Events
+
+    /// A live, ordered stream of state-machine events.
+    ///
+    /// Events arrive in the order the coordinator applied them, because the
+    /// actor's serial executor is also what orders the state changes they
+    /// describe. Each carries `sessionGeneration`, so a host can discard events
+    /// belonging to a session it has already replaced.
+    ///
+    /// The stream is bounded: when a consumer falls behind, the oldest buffered
+    /// events are dropped rather than growing memory or applying backpressure
+    /// to the DAVE state machine, which must never be stalled by a logger.
+    /// Multiple subscribers are independent.
+    ///
+    /// - Parameter bufferSize: Events buffered before the oldest are dropped.
+    ///   Defaults to ``DaveCoordinatorLimits/diagnosticEventBufferSize``.
+    public func diagnosticEvents(bufferSize: Int? = nil) -> AsyncStream<DaveDiagnosticEvent> {
+        let capacity = max(1, bufferSize ?? limits.diagnosticEventBufferSize)
+        let id = UUID()
+        return AsyncStream(
+            DaveDiagnosticEvent.self,
+            bufferingPolicy: .bufferingNewest(capacity)
+        ) { continuation in
+            continuation.onTermination = { [weak self] _ in
+                // Hops back onto the actor; a cancelled consumer must not leave
+                // a dead continuation behind to be yielded to forever.
+                Task { await self?.removeDiagnosticSubscriber(id) }
+            }
+            registerDiagnosticSubscriber(id, continuation)
+        }
+    }
+
+    /// Ends every live stream. Subscribers see normal termination.
+    public func finishDiagnosticEventStreams() {
+        for continuation in eventSubscribers.values {
+            continuation.finish()
+        }
+        eventSubscribers.removeAll()
+    }
+
+    private func registerDiagnosticSubscriber(
+        _ id: UUID,
+        _ continuation: AsyncStream<DaveDiagnosticEvent>.Continuation
+    ) {
+        eventSubscribers[id] = continuation
+    }
+
+    private func removeDiagnosticSubscriber(_ id: UUID) {
+        eventSubscribers.removeValue(forKey: id)
+    }
+
+    /// Records one state-machine event: appends it to the bounded trace and
+    /// delivers it to live subscribers.
+    ///
+    /// Call sites pass classifications and sizes only. No parameter accepts
+    /// payload bytes, so an event cannot carry MLS material by construction.
+    @discardableResult
+    private func emit(
+        _ kind: DaveDiagnosticEventKind,
+        outcome: DaveDiagnosticEventOutcome,
+        transitionId: UInt64? = nil,
+        recoveryHint: DaveRecoveryHint = .none,
+        payloadByteCount: Int? = nil,
+        emittedOutboundActionIds: [UUID] = [],
+        acknowledgedOutboundActionId: UUID? = nil,
+        detail: String? = nil,
+        failure: DaveFailureReport? = nil
+    ) -> DaveDiagnosticEvent {
+        diagnosticEventSequence &+= 1
+        let event = DaveDiagnosticEvent(
+            id: diagnosticEventSequence,
+            sessionGeneration: sessionGeneration,
+            kind: kind,
+            outcome: outcome,
+            transitionId: transitionId,
+            mediaReady: mediaReady,
+            recoveryHint: recoveryHint,
+            payloadByteCount: payloadByteCount,
+            emittedOutboundActionIds: emittedOutboundActionIds,
+            pendingOutboundActionIds: pendingOutboundActionOrder,
+            acknowledgedOutboundActionId: acknowledgedOutboundActionId,
+            detail: detail,
+            failure: failure
+        )
+
+        if limits.traceEventCapacity > 0 {
+            traceEvents.append(event)
+            if traceEvents.count > limits.traceEventCapacity {
+                traceEvents.removeFirst(traceEvents.count - limits.traceEventCapacity)
+            }
+        }
+
+        for continuation in eventSubscribers.values {
+            continuation.yield(event)
+        }
+        return event
+    }
+
+    /// Single choke point for media readiness, so every change is observable
+    /// and no path can silently enable or revoke media.
+    private func setMediaReady(_ ready: Bool, reason: String) {
+        guard mediaReady != ready else {
+            mediaReady = ready
+            return
+        }
+        mediaReady = ready
+        emit(.mediaReadinessChanged, outcome: .observed, detail: reason)
+    }
+
     // MARK: - Private Helpers
 
     private func processMlsTransition(_ transition: DiscordTransition) throws -> ProcessedMlsTransition {
@@ -1341,6 +1556,12 @@ public actor DaveSessionCoordinator {
             handshakeState = .ready
             lastMlsError = nil
             lastRecoveryAction = .processWelcome
+            emit(
+                .welcomeProcessed,
+                outcome: .applied,
+                payloadByteCount: welcomeData.count,
+                detail: "roster \(welcomeResult.rosterMemberIds.count)"
+            )
             return ProcessedMlsTransition(kind: .welcome, didApply: true, outboundRatchet: ratchet)
 
         case .commit(let commitData):
@@ -1357,6 +1578,7 @@ public actor DaveSessionCoordinator {
                 handshakeState = .ready
                 lastMlsError = nil
                 lastRecoveryAction = .processCommit
+                emit(.commitProcessed, outcome: .observed, payloadByteCount: commitData.count, detail: "ignored")
                 return ProcessedMlsTransition(kind: .commit, didApply: false, outboundRatchet: nil)
             }
             guard let ratchet = session.getKeyRatchet(userId: selfUserId) else {
@@ -1375,6 +1597,12 @@ public actor DaveSessionCoordinator {
             handshakeState = .ready
             lastMlsError = nil
             lastRecoveryAction = .processCommit
+            emit(
+                .commitProcessed,
+                outcome: .applied,
+                payloadByteCount: commitData.count,
+                detail: "roster \(commitResult.rosterMemberIds.count)"
+            )
             return ProcessedMlsTransition(kind: .commit, didApply: true, outboundRatchet: ratchet)
         }
     }
@@ -1390,7 +1618,11 @@ public actor DaveSessionCoordinator {
         let executeSeen = stagedTransitions[id]?.executeSeen ?? false
         if let existing = stagedTransitions[id], existing.outboundRatchet != nil {
             guard existing.source == source, existing.protocolVersion == protocolVersion else {
-                failClosed(reason: "Conflicting staged transition \(id)")
+                failClosed(
+                    reason: "Conflicting staged transition \(id)",
+                    code: .transitionConflict,
+                    origin: .wrapper
+                )
                 throw DaveError.transitionConflict(transitionId: id)
             }
             return existing.executeSeen
@@ -1418,6 +1650,7 @@ public actor DaveSessionCoordinator {
         refreshPendingTransitionID()
         lastRecoveryAction = .stageTransition
         lastTransitionTimestamp = Date()
+        emit(.transitionStaged, outcome: .staged, transitionId: id, detail: source.rawValue)
         return executeSeen
     }
 
@@ -1449,7 +1682,11 @@ public actor DaveSessionCoordinator {
             return false
         }
         guard let encryptor else {
-            failClosed(reason: "No encryptor available to activate transition \(transitionId)")
+            failClosed(
+                reason: "No encryptor available to activate transition \(transitionId)",
+                code: .encryptorUnavailable,
+                origin: .wrapper
+            )
             return false
         }
 
@@ -1471,11 +1708,12 @@ public actor DaveSessionCoordinator {
         stagedTransitions[transitionId] = nil
         stagedTransitionOrder.removeAll { $0 == transitionId }
         refreshPendingTransitionID()
-        mediaReady = true
+        setMediaReady(true, reason: reason)
         clearMediaReadinessWatchdog()
         markExecuteTransitionActivated(transitionId)
         lastRecoveryAction = .activateTransition
         lastTransitionTimestamp = Date()
+        emit(.transitionActivated, outcome: .activated, transitionId: transitionId, detail: reason)
         return true
     }
 
@@ -1489,13 +1727,17 @@ public actor DaveSessionCoordinator {
         reason: String
     ) {
         guard let encryptor else {
-            failClosed(reason: "No encryptor available to activate legacy transition")
+            failClosed(
+                reason: "No encryptor available to activate legacy transition",
+                code: .encryptorUnavailable,
+                origin: .wrapper
+            )
             return
         }
         encryptor.setKeyRatchet(ratchet)
         activeOutboundRatchet = ratchet
         activeTransitionId = transitionId
-        mediaReady = false
+        setMediaReady(false, reason: reason)
         lastRecoveryAction = .activateTransition
         lastTransitionTimestamp = Date()
     }
@@ -1530,6 +1772,7 @@ public actor DaveSessionCoordinator {
                 stagedTransitions[id] = nil
                 overflow -= 1
                 evictedTransitionCount &+= 1
+                emit(.stateEvicted, outcome: .observed, transitionId: id, detail: "staged transition aged out")
                 continue
             }
             survivors.append(id)
@@ -1567,9 +1810,21 @@ public actor DaveSessionCoordinator {
         let key = ledgerKey(kind: kind, transitionId: transitionId, payload: payload)
         guard let entry = transitionLedger[key] else { return nil }
         guard entry.payloadDigest == payloadDigest(payload) else {
-            failClosed(reason: "Conflicting payload for transition \(transitionId)")
+            failClosed(
+                reason: "Conflicting payload for transition \(transitionId)",
+                code: .transitionConflict,
+                origin: .wrapper
+            )
             return makeDiscordResult(recoveryHint: .recreateSession)
         }
+        emit(
+            .gatewayEventReceived,
+            outcome: .replayed,
+            transitionId: transitionId,
+            recoveryHint: entry.recoveryHint,
+            payloadByteCount: payload?.count,
+            detail: kind.rawValue
+        )
         return makeDiscordResult(actions: entry.actions, recoveryHint: entry.recoveryHint)
     }
 
@@ -1583,9 +1838,21 @@ public actor DaveSessionCoordinator {
         guard entry.kind == kind,
               entry.transitionId == transitionId,
               entry.payloadDigest == payloadDigest(payload) else {
-            failClosed(reason: "Conflicting replay ledger entry for \(kind.rawValue)")
+            failClosed(
+                reason: "Conflicting replay ledger entry for \(kind.rawValue)",
+                code: .transitionConflict,
+                origin: .wrapper
+            )
             return makeDiscordResult(recoveryHint: .recreateSession)
         }
+        emit(
+            .gatewayEventReceived,
+            outcome: .replayed,
+            transitionId: transitionId,
+            recoveryHint: entry.recoveryHint,
+            payloadByteCount: payload?.count,
+            detail: kind.rawValue
+        )
         return makeDiscordResult(actions: entry.actions, recoveryHint: entry.recoveryHint)
     }
 
@@ -1604,7 +1871,11 @@ public actor DaveSessionCoordinator {
         }
 
         guard existing.kind == kind, existing.payloadDigest == payloadDigest(payload) else {
-            failClosed(reason: "Conflicting MLS transition identity \(transitionId)")
+            failClosed(
+                reason: "Conflicting MLS transition identity \(transitionId)",
+                code: .transitionConflict,
+                origin: .wrapper
+            )
             throw DaveError.transitionConflict(transitionId: transitionId)
         }
     }
@@ -1615,7 +1886,11 @@ public actor DaveSessionCoordinator {
         guard transitionLedger.count < limits.maximumTrackedTransitions else {
             // Every entry is still pinned (unacknowledged outbound actions, or
             // the live transition). That is a stalled host, not a long call.
-            failClosed(reason: "Exceeded the configured transition replay-ledger limit")
+            failClosed(
+                reason: "Exceeded the configured transition replay-ledger limit",
+                code: .resourceLimitExceeded,
+                origin: .wrapper
+            )
             throw DaveError.payloadTooLarge(
                 kind: "transition replay ledger",
                 maximum: limits.maximumTrackedTransitions,
@@ -1652,6 +1927,12 @@ public actor DaveSessionCoordinator {
                 transitionLedger[key] = nil
                 overflow -= 1
                 evictedTransitionCount &+= 1
+                emit(
+                    .stateEvicted,
+                    outcome: .observed,
+                    transitionId: entry.transitionId,
+                    detail: "replay ledger entry aged out"
+                )
                 continue
             }
             survivors.append(key)
@@ -1710,7 +1991,11 @@ public actor DaveSessionCoordinator {
         if transitionLedger[key] == nil {
             evictTransitionLedgerEntries(reserving: 1)
             guard transitionLedger.count < limits.maximumTrackedTransitions else {
-                failClosed(reason: "Exceeded the configured transition replay-ledger limit")
+                failClosed(
+                    reason: "Exceeded the configured transition replay-ledger limit",
+                    code: .resourceLimitExceeded,
+                    origin: .wrapper
+                )
                 return
             }
             transitionLedgerOrder.append(key)
@@ -1734,7 +2019,11 @@ public actor DaveSessionCoordinator {
         if actionIDs.isEmpty, !fallback.outboundActions.isEmpty {
             for action in fallback.outboundActions {
                 guard pendingOutboundActionOrder.count < limits.maximumPendingOutboundActions else {
-                    failClosed(reason: "Exceeded the configured outbound-action limit")
+                    failClosed(
+                        reason: "Exceeded the configured outbound-action limit",
+                        code: .resourceLimitExceeded,
+                        origin: .wrapper
+                    )
                     break
                 }
                 let id = UUID()
@@ -1749,6 +2038,7 @@ public actor DaveSessionCoordinator {
             if !actionIDs.isEmpty {
                 lastRecoveryAction = .queueOutboundAction
                 lastTransitionTimestamp = Date()
+                emit(.outboundActionQueued, outcome: .observed, emittedOutboundActionIds: actionIDs)
             }
         }
 
@@ -1847,7 +2137,15 @@ public actor DaveSessionCoordinator {
         }
         unrecognizedRosterUserIds = rosterUserIds.filter { !expected.contains($0) }
 
-        guard !unrecognizedRosterUserIds.isEmpty else { return }
+        guard !unrecognizedRosterUserIds.isEmpty else {
+            emit(.rosterApplied, outcome: .applied, detail: "\(rosterUserIds.count) members, all recognized")
+            return
+        }
+        emit(
+            .rosterApplied,
+            outcome: limits.unrecognizedRosterMemberPolicy == .failClosed ? .rejected : .applied,
+            detail: "\(unrecognizedRosterUserIds.count) unrecognized of \(rosterUserIds.count)"
+        )
         if limits.unrecognizedRosterMemberPolicy == .failClosed {
             throw DaveError.unrecognizedRosterMembers(userIds: unrecognizedRosterUserIds)
         }
@@ -1896,13 +2194,28 @@ public actor DaveSessionCoordinator {
 
     private func handleMLSFailure(source: String, reason: String, generation: UInt64) {
         guard generation == sessionGeneration else { return }
-        failClosed(reason: "Source: \(source), Reason: \(reason)")
+        emit(.nativeMlsFailure, outcome: .failed, detail: source)
+        // Source and reason are preserved as separate fields so a host can
+        // aggregate by source without parsing a formatted string.
+        failClosed(
+            reason: "Source: \(source), Reason: \(reason)",
+            code: .nativeMlsFailure,
+            origin: .nativeMls,
+            nativeSource: source,
+            nativeReason: reason
+        )
     }
 
     /// Native MLS failures must revoke media capability immediately. Leaving an
     /// existing encryptor live after an asynchronous failure risks sending on a
     /// stale ratchet even though diagnostics say the handshake failed.
-    private func failClosed(reason: String) {
+    private func failClosed(
+        reason: String,
+        code: DaveFailureCode = .nativeMlsFailure,
+        origin: DaveFailureOrigin = .nativeMls,
+        nativeSource: String? = nil,
+        nativeReason: String? = nil
+    ) {
         encryptorGeneration &+= 1
         encryptor = nil
         activeOutboundRatchet = nil
@@ -1920,7 +2233,6 @@ public actor DaveSessionCoordinator {
         pendingOutboundActionOrder.removeAll()
         hasIssuedInitialKeyPackage = false
         hasSentInitialKeyPackage = false
-        mediaReady = false
         pendingEpoch = nil
         pendingTransitionId = nil
         pendingProtocolVersion = nil
@@ -1932,6 +2244,18 @@ public actor DaveSessionCoordinator {
         lastMlsError = reason
         lastRecoveryAction = .failClosed
         lastTransitionTimestamp = Date()
+
+        let report = DaveFailureReport(
+            code: code,
+            origin: origin,
+            nativeSource: nativeSource,
+            nativeReason: nativeReason,
+            message: reason,
+            sessionGeneration: sessionGeneration
+        )
+        lastFailureReport = report
+        setMediaReady(false, reason: "failed closed")
+        emit(.sessionFailedClosed, outcome: .failed, recoveryHint: .recreateSession, failure: report)
     }
 
     /// Drains the most recent native MLS failure (reported via the failure
@@ -1951,7 +2275,7 @@ public actor DaveSessionCoordinator {
         guard !hasIssuedInitialKeyPackage else {
             return nil
         }
-        if requireExternalSender, externalSenderState != .registered {
+        if requireExternalSender, externalSenderState != .submitted {
             throw DaveError.externalSenderRequired
         }
 
@@ -1998,13 +2322,14 @@ public actor DaveSessionCoordinator {
     /// the matching Execute Transition. Preserve an existing watchdog (which
     /// carries the transition ID supplied by the high-level gateway helper).
     private func beginMediaReadinessWait(reason: String, timeout: TimeInterval? = nil) {
-        mediaReady = false
+        setMediaReady(false, reason: reason)
         if mediaReadinessWatchdogStartedAt == nil {
             mediaReadinessWatchdogStartedAt = .now
             mediaReadinessWatchdogStartedDate = Date()
             mediaReadinessWatchdogTimeout = max(0, timeout ?? limits.mediaReadinessTimeout)
             mediaReadinessWatchdogReason = reason
             scheduleMediaReadinessWatchdog()
+            emit(.watchdogStarted, outcome: .observed, detail: reason)
         }
     }
 
@@ -2054,7 +2379,12 @@ public actor DaveSessionCoordinator {
               case .timedOut(let reason, _) = evaluateMediaReadinessWatchdog() else {
             return
         }
-        failClosed(reason: "DAVE media readiness watchdog expired: \(reason)")
+        emit(.watchdogExpired, outcome: .failed, detail: reason)
+        failClosed(
+            reason: "DAVE media readiness watchdog expired: \(reason)",
+            code: .watchdogExpired,
+            origin: .wrapper
+        )
     }
 
     /// Discord's DAVE implementation parses user IDs as unsigned integer
@@ -2130,7 +2460,9 @@ public actor DaveSessionCoordinator {
         let expected = pendingProtocolVersion ?? protocolVersion
         guard reported == expected else {
             failClosed(
-                reason: "Encryptor reported protocol version \(reported), expected \(expected)"
+                reason: "Encryptor reported protocol version \(reported), expected \(expected)",
+                code: .protocolVersionRejected,
+                origin: .wrapper
             )
             return
         }
