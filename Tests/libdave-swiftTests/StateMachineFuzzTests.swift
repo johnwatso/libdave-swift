@@ -209,6 +209,22 @@ final class StateMachineFuzzTests: XCTestCase {
                     seed: seed,
                     step: step
                 )
+
+                let diagnostics = await coordinator.getDiagnostics()
+                XCTAssertLessThanOrEqual(
+                    diagnostics.recentEvents.count,
+                    limits.traceEventCapacity,
+                    "seed \(seed), step \(step): trace exceeded capacity"
+                )
+                // Diagnostics get shipped to monitoring pipelines, so no
+                // reachable state may be unencodable. Sampled rather than run
+                // every step, which would dominate the suite's runtime.
+                if step % 20 == 0 {
+                    XCTAssertNoThrow(
+                        try JSONEncoder().encode(diagnostics),
+                        "seed \(seed), step \(step): diagnostics must always encode"
+                    )
+                }
             }
         }
     }

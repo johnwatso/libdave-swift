@@ -22,6 +22,11 @@ older payloads instead of rejecting them.
   swift-tools-version 6.0, so a Swift 6 toolchain is required. This is not a
   new constraint in practice: the package already requires macOS 26, whose SDK
   ships one.
+- `DaveExternalSenderState.registered` is renamed `submitted`, and a `rejected`
+  case is added. Archived diagnostics containing the old spelling still decode.
+  There is deliberately no `accepted` case: `daveSessionSetExternalSender`
+  returns `void` and the C API exposes no way to observe that a pending MLS
+  group was created, so only rejection is detectable.
 
 ### Fixed
 
@@ -58,6 +63,20 @@ older payloads instead of rejecting them.
   immediately or postpone a stalled one indefinitely.
 - The async pairwise-fingerprint call can no longer suspend forever if a
   native callback never arrives; it returns `nil` after a timeout.
+- **A diagnostics subscriber no longer hangs forever when its coordinator is
+  released.** Subscriber bookkeeping lived in the actor's isolated state and the
+  termination handler hopped back onto the actor, so once the coordinator was
+  deallocated nothing could finish the streams — a host building a coordinator
+  per voice connection leaked one permanently suspended task per connection.
+  Bookkeeping moved to a lock-guarded broadcaster that a cancelled consumer and
+  `deinit` can both reach.
+- **A specific failure is no longer flattened by a later generic one.** The
+  native MLS failure callback fires during the same native call that a
+  synchronous path may already have classified precisely, and overwrote it with
+  `nativeMlsFailure`. The first report — the cause — is now kept.
+- **Every public gateway entry point records a diagnostic event**, not only
+  `consumeDiscordGatewayEvent(_:)`. A host using the documented per-message
+  helpers previously got an almost empty trace.
 
 ### Added
 
@@ -90,8 +109,40 @@ older payloads instead of rejecting them.
   without new code; until then the test skips with an explanation, so the one
   remaining coverage gap is visible in test output. A committed self-check
   fixture keeps the harness itself exercised.
+- **A bounded diagnostic trace.** `DaveDiagnostics.recentEvents` keeps the most
+  recent state-machine events — timestamp, session generation, kind, transition
+  ID, outcome (`applied`, `staged`, `activated`, `replayed`, `rejected`,
+  `failed`, `observed`), media readiness, recovery hint, and emitted, pending
+  and acknowledged outbound action IDs. It survives reset and recovery, because
+  the events explaining *why* a session was recreated are the ones a post-mortem
+  needs, and each entry names its generation. Capacity comes from
+  `DaveCoordinatorLimits.traceEventCapacity`. Events never carry MLS payloads,
+  ratchets, keys, or external-sender bytes — a payload appears only as a byte
+  count — so the whole structure is safe to export.
+- **A live diagnostics stream.** `DaveSessionCoordinator.diagnosticEvents()`
+  returns an `AsyncStream<DaveDiagnosticEvent>` carrying the same events in the
+  order the coordinator applied them, each tagged with its session generation so
+  a host can discard events from a session it has already replaced. Subscribers
+  are independent and individually bounded: a slow consumer drops its own oldest
+  events rather than growing memory or stalling the DAVE state machine.
+- **Watchdog state, limits, and counts in diagnostics.** The media-readiness
+  watchdog is reported as inactive, pending (with start time, timeout, remaining
+  time and reason), or timed out (with reason and recovery hint), alongside the
+  configured `DaveCoordinatorLimits` and live staged-transition and pending
+  outbound action counts.
+- **Structured failure reporting.** `DaveDiagnostics.lastFailure` is a
+  `DaveFailureReport` carrying a machine-readable `DaveFailureCode`, an origin
+  (`nativeMls`, `wrapper`, or `policy`), the native MLS source and reason kept
+  as separate fields, and the session generation. `DaveError` exposes matching
+  `failureCode` and `failureOrigin`, so hosts branch on codes instead of parsing
+  `lastMlsError`.
 - AddressSanitizer and ThreadSanitizer CI jobs, a release-configuration test
   run, and `-warnings-as-errors` on the build.
+- `Docs/NATIVE_CALLBACK_CONTRACT.md`, recording the measured native callback
+  delivery behaviour (always synchronous, on the calling thread, never after
+  owner destruction), the tests that hold it in place, why the inert-tombstone
+  workaround is still kept, and the upstream unregister-and-drain API that would
+  remove the need for it.
 
 ### Security
 

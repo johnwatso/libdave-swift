@@ -171,8 +171,10 @@ public actor DaveSessionCoordinator {
     /// payloads, ratchets, or key material — only classifications and sizes.
     private var traceEvents: [DaveDiagnosticEvent] = []
     /// Live subscribers. Each has its own bounded buffer, so a slow consumer
-    /// degrades only its own stream.
-    private var eventSubscribers: [UUID: AsyncStream<DaveDiagnosticEvent>.Continuation] = [:]
+    /// degrades only its own stream. Held outside the actor's isolated state so
+    /// that `deinit` and a cancelled consumer can both tear down without
+    /// needing the actor to be alive.
+    private let eventBroadcaster = DaveDiagnosticEventBroadcaster()
     /// Most recent structured failure, for hosts that branch on codes rather
     /// than parsing `lastMlsError`.
     private var lastFailureReport: DaveFailureReport?
@@ -190,6 +192,15 @@ public actor DaveSessionCoordinator {
         self.authSessionId = authSessionId
         self.limits = limits
         self.mediaReadinessWatchdogTimeout = limits.mediaReadinessTimeout
+    }
+
+    deinit {
+        // Without this, a consumer of `diagnosticEvents()` stays suspended
+        // forever once the coordinator goes away: nothing else can ever finish
+        // its stream. A host that builds a coordinator per voice connection
+        // would leak one suspended task per connection.
+        eventBroadcaster.finishAll()
+        mediaReadinessWatchdogTask?.cancel()
     }
 
     /// Configures the coordinator specifically for Discord Voice usage.
@@ -1473,38 +1484,25 @@ public actor DaveSessionCoordinator {
             DaveDiagnosticEvent.self,
             bufferingPolicy: .bufferingNewest(capacity)
         ) { continuation in
-            continuation.onTermination = { [weak self] _ in
-                // Hops back onto the actor; a cancelled consumer must not leave
-                // a dead continuation behind to be yielded to forever.
-                Task { await self?.removeDiagnosticSubscriber(id) }
+            // Captures the broadcaster, not the actor: a consumer that is
+            // cancelled while the coordinator is deallocating must still be
+            // able to unregister itself.
+            continuation.onTermination = { [eventBroadcaster] _ in
+                eventBroadcaster.remove(id)
             }
-            registerDiagnosticSubscriber(id, continuation)
+            eventBroadcaster.add(id, continuation)
         }
     }
 
     /// Ends every live stream. Subscribers see normal termination.
     public func finishDiagnosticEventStreams() {
-        for continuation in eventSubscribers.values {
-            continuation.finish()
-        }
-        eventSubscribers.removeAll()
-    }
-
-    private func registerDiagnosticSubscriber(
-        _ id: UUID,
-        _ continuation: AsyncStream<DaveDiagnosticEvent>.Continuation
-    ) {
-        eventSubscribers[id] = continuation
+        eventBroadcaster.finishAll()
     }
 
     /// Live subscriber count. Exposed for tests asserting that terminated
     /// subscribers are released rather than yielded to forever.
     internal func activeDiagnosticSubscriberCount() -> Int {
-        eventSubscribers.count
-    }
-
-    private func removeDiagnosticSubscriber(_ id: UUID) {
-        eventSubscribers.removeValue(forKey: id)
+        eventBroadcaster.count
     }
 
     /// Records one state-machine event: appends it to the bounded trace and
@@ -1548,9 +1546,7 @@ public actor DaveSessionCoordinator {
             }
         }
 
-        for continuation in eventSubscribers.values {
-            continuation.yield(event)
-        }
+        eventBroadcaster.yield(event)
         return event
     }
 

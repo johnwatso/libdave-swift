@@ -204,6 +204,59 @@ final class DiagnosticEventTests: XCTestCase {
         XCTAssertEqual(remaining, 0, "terminated subscribers must be released")
     }
 
+    /// Regression: a subscriber used to stay suspended forever once the
+    /// coordinator was released, because nothing could finish its stream. A
+    /// host that builds a coordinator per voice connection leaked one
+    /// permanently-suspended task per connection.
+    func testStreamTerminatesWhenTheCoordinatorIsDeallocated() async throws {
+        func makeOrphanedStream() async throws -> AsyncStream<DaveDiagnosticEvent> {
+            let coordinator = try await makeCoordinator()
+            let stream = await coordinator.diagnosticEvents()
+            _ = await coordinator.executeDiscordTransition(1)
+            return stream
+        }
+
+        // The coordinator is unreferenced once this returns.
+        let stream = try await makeOrphanedStream()
+
+        let didTerminate = LockedFlag()
+        let drain = Task {
+            for await _ in stream {}
+            didTerminate.set()
+        }
+        defer { drain.cancel() }
+
+        // Polls so the test finishes the moment the stream does, rather than
+        // waiting out a fixed deadline.
+        for _ in 0..<100 where !didTerminate.value {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+
+        XCTAssertTrue(
+            didTerminate.value,
+            "the stream must finish when its coordinator is deallocated"
+        )
+    }
+
+    /// Minimal locked flag, so the polling above stays free of data races under
+    /// the thread sanitizer.
+    private final class LockedFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var flag = false
+
+        var value: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return flag
+        }
+
+        func set() {
+            lock.lock()
+            flag = true
+            lock.unlock()
+        }
+    }
+
     func testFinishingStreamsTerminatesConsumers() async throws {
         let coordinator = try await makeCoordinator()
         let stream = await coordinator.diagnosticEvents()
@@ -246,6 +299,51 @@ final class DiagnosticEventTests: XCTestCase {
             if delivered >= 4 { break }
         }
         XCTAssertEqual(delivered, 4, "the buffer bounds what a slow consumer retains")
+    }
+
+    /// Subscribers come and go while events are being emitted. The broadcaster
+    /// is shared mutable state reachable from cancelled consumers, the actor,
+    /// and `deinit`, so this is the shape a locking bug would show up in —
+    /// especially under the thread sanitizer.
+    func testConcurrentSubscribeCancelAndEmitIsSafe() async throws {
+        let coordinator = try await makeCoordinator(
+            limits: DaveCoordinatorLimits(maximumTrackedTransitions: 8, diagnosticEventBufferSize: 8)
+        )
+
+        await withTaskGroup(of: Void.self) { group in
+            // Churn: subscribers that consume a little and then drop out.
+            for _ in 0..<16 {
+                group.addTask {
+                    for _ in 0..<8 {
+                        let stream = await coordinator.diagnosticEvents()
+                        var seen = 0
+                        for await _ in stream {
+                            seen += 1
+                            if seen >= 2 { break }
+                        }
+                    }
+                }
+            }
+            // Meanwhile the state machine keeps producing events.
+            for _ in 0..<8 {
+                group.addTask {
+                    for transitionId in 1...40 {
+                        _ = await coordinator.executeDiscordTransition(UInt64(transitionId))
+                    }
+                }
+            }
+        }
+
+        // The coordinator survived, and no subscriber leaked.
+        let diagnostics = await coordinator.getDiagnostics()
+        XCTAssertNotEqual(diagnostics.handshakeState, .failed)
+
+        var remaining = await coordinator.activeDiagnosticSubscriberCount()
+        for _ in 0..<100 where remaining > 0 {
+            try? await Task.sleep(for: .milliseconds(20))
+            remaining = await coordinator.activeDiagnosticSubscriberCount()
+        }
+        XCTAssertEqual(remaining, 0, "every terminated subscriber must be released")
     }
 
     // MARK: - Watchdog, limits and counts

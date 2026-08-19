@@ -258,3 +258,62 @@ public struct DaveWatchdogDiagnostics: Codable, Sendable, Equatable {
 
     public static let inactive = DaveWatchdogDiagnostics(state: .inactive)
 }
+
+
+/// Thread-safe fan-out of diagnostic events to live subscribers.
+///
+/// Subscriber bookkeeping deliberately lives outside the coordinator actor.
+/// Both teardown paths have to work when the actor is unavailable or already
+/// going away: a cancelled consumer must remove itself without hopping onto an
+/// actor that may be deallocating, and the coordinator's `deinit` must be able
+/// to finish every stream. Without that, a consumer of a coordinator that has
+/// been released stays suspended forever — one leaked task per voice session in
+/// a client that builds a coordinator per connection.
+internal final class DaveDiagnosticEventBroadcaster: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [UUID: AsyncStream<DaveDiagnosticEvent>.Continuation] = [:]
+
+    init() {}
+
+    func add(_ id: UUID, _ continuation: AsyncStream<DaveDiagnosticEvent>.Continuation) {
+        lock.lock()
+        continuations[id] = continuation
+        lock.unlock()
+    }
+
+    func remove(_ id: UUID) {
+        lock.lock()
+        let continuation = continuations.removeValue(forKey: id)
+        lock.unlock()
+        // Finishing an already-terminated stream is a harmless no-op.
+        continuation?.finish()
+    }
+
+    /// Delivers to every subscriber. The snapshot is taken under the lock and
+    /// yielded outside it, so a subscriber's buffering policy can never run
+    /// while the lock is held.
+    func yield(_ event: DaveDiagnosticEvent) {
+        lock.lock()
+        let snapshot = continuations
+        lock.unlock()
+        for continuation in snapshot.values {
+            continuation.yield(event)
+        }
+    }
+
+    func finishAll() {
+        lock.lock()
+        let snapshot = continuations
+        continuations.removeAll()
+        lock.unlock()
+        for continuation in snapshot.values {
+            continuation.finish()
+        }
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return continuations.count
+    }
+}
