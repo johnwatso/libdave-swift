@@ -234,6 +234,28 @@ public enum DaveExternalSenderState: String, Codable, Sendable {
     /// Native MLS reported a failure for the submitted sender. The session is
     /// failed closed; recreate it before submitting another.
     case rejected
+
+    /// Decoding accepts the pre-3.0 spelling `registered`, which meant exactly
+    /// what ``submitted`` means now. Diagnostics are archived and forwarded to
+    /// monitoring pipelines, so renaming a case must not turn existing records
+    /// into decode errors.
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        switch raw {
+        case "registered":
+            self = .submitted
+        default:
+            guard let value = DaveExternalSenderState(rawValue: raw) else {
+                throw DecodingError.dataCorrupted(
+                    .init(
+                        codingPath: decoder.codingPath,
+                        debugDescription: "Unknown DaveExternalSenderState value '\(raw)'"
+                    )
+                )
+            }
+            self = value
+        }
+    }
 }
 
 /// Last meaningful recovery or state-machine action performed by the coordinator.

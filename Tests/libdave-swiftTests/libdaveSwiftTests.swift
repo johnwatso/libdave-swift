@@ -175,7 +175,10 @@ final class libdaveSwiftTests: XCTestCase {
         diagnostics = await coordinator.getDiagnostics()
         XCTAssertEqual(diagnostics.handshakeState, .failed)
         XCTAssertFalse(diagnostics.isExternalSenderRegistered)
-        XCTAssertEqual(diagnostics.externalSenderState, .missing)
+        // A rejected sender stays visible as `.rejected` until the session is
+        // recreated, which is the window in which a host needs to know why it
+        // failed. `reset()` returns it to `.missing`.
+        XCTAssertEqual(diagnostics.externalSenderState, .rejected)
         XCTAssertEqual(diagnostics.lastRecoveryAction, .failClosed)
 
         // Reset
@@ -266,6 +269,9 @@ final class libdaveSwiftTests: XCTestCase {
         }
 
         let diagnostics = await coordinator.getDiagnostics()
+        // `.rejected` is reserved for a sender native MLS refused. An empty
+        // payload never reaches native code, so nothing was submitted and the
+        // state stays `.missing`.
         XCTAssertEqual(diagnostics.externalSenderState, .missing)
         XCTAssertFalse(diagnostics.isExternalSenderRegistered)
     }
@@ -854,7 +860,10 @@ final class libdaveSwiftTests: XCTestCase {
         XCTAssertTrue(sawNativeSenderFailure)
         XCTAssertEqual(diagnostics.handshakeState, .failed)
         XCTAssertEqual(diagnostics.lastRecoveryAction, .failClosed)
-        XCTAssertEqual(diagnostics.externalSenderState, .missing)
+        // A rejected sender stays visible as `.rejected` until the session is
+        // recreated, which is the window in which a host needs to know why it
+        // failed. `reset()` returns it to `.missing`.
+        XCTAssertEqual(diagnostics.externalSenderState, .rejected)
         XCTAssertFalse(diagnostics.mediaReady)
     }
 

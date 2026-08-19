@@ -58,6 +58,25 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
     /// it is the signal that the session is aging out old state rather than
     /// hitting a hard limit.
     public let evictedTransitionCount: UInt64
+    /// Media-readiness watchdog state, including why media is paused and how
+    /// long is left before the session fails closed.
+    public let watchdog: DaveWatchdogDiagnostics
+    /// The bounds this coordinator was configured with, so a diagnostic export
+    /// is interpretable without the host also recording its configuration.
+    public let limits: DaveCoordinatorLimits
+    /// Ratchets staged for a future Execute Transition.
+    public let stagedTransitionCount: Int
+    /// Most recent structured failure. Prefer this over ``lastMlsError`` for
+    /// anything that branches on the failure rather than displaying it.
+    public let lastFailure: DaveFailureReport?
+    /// Bounded trace of recent state-machine events, oldest first.
+    ///
+    /// This is the post-mortem view: what arrived, what it did, and what
+    /// changed. It survives reset and recovery, and every entry carries the
+    /// session generation it belongs to. It never contains MLS payloads,
+    /// ratchets, keys, or external-sender bytes — only classifications, sizes,
+    /// and identifiers, so the whole structure is safe to export.
+    public let recentEvents: [DaveDiagnosticEvent]
 
     public init(
         sessionGeneration: UInt64 = 0,
@@ -80,7 +99,12 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         pendingOutboundActionCount: Int = 0,
         rosterMemberCount: Int = 0,
         unrecognizedRosterMemberCount: Int = 0,
-        evictedTransitionCount: UInt64 = 0
+        evictedTransitionCount: UInt64 = 0,
+        watchdog: DaveWatchdogDiagnostics = .inactive,
+        limits: DaveCoordinatorLimits = .default,
+        stagedTransitionCount: Int = 0,
+        lastFailure: DaveFailureReport? = nil,
+        recentEvents: [DaveDiagnosticEvent] = []
     ) {
         self.sessionGeneration = sessionGeneration
         self.protocolVersion = protocolVersion
@@ -103,6 +127,11 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
         self.rosterMemberCount = rosterMemberCount
         self.unrecognizedRosterMemberCount = unrecognizedRosterMemberCount
         self.evictedTransitionCount = evictedTransitionCount
+        self.watchdog = watchdog
+        self.limits = limits
+        self.stagedTransitionCount = stagedTransitionCount
+        self.lastFailure = lastFailure
+        self.recentEvents = recentEvents
     }
 
     /// Decoding tolerates payloads written by an older release: fields added
@@ -145,6 +174,23 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
             forKey: .unrecognizedRosterMemberCount
         ) ?? 0
         evictedTransitionCount = try container.decodeIfPresent(UInt64.self, forKey: .evictedTransitionCount) ?? 0
+        watchdog = try container.decodeIfPresent(DaveWatchdogDiagnostics.self, forKey: .watchdog) ?? .inactive
+        limits = try container.decodeIfPresent(DaveCoordinatorLimits.self, forKey: .limits) ?? .default
+        stagedTransitionCount = try container.decodeIfPresent(Int.self, forKey: .stagedTransitionCount) ?? 0
+        lastFailure = try container.decodeIfPresent(DaveFailureReport.self, forKey: .lastFailure)
+        recentEvents = try container.decodeIfPresent([DaveDiagnosticEvent].self, forKey: .recentEvents) ?? []
+    }
+
+    private var watchdogSummary: String {
+        switch watchdog.state {
+        case .inactive:
+            return "inactive"
+        case .pending:
+            let remaining = watchdog.secondsRemaining.map { String(format: "%.1fs", $0) } ?? "?"
+            return "pending, \(remaining) left (\(watchdog.reason ?? "unspecified"))"
+        case .timedOut:
+            return "timed out (\(watchdog.reason ?? "unspecified"))"
+        }
     }
 
     public var debugDescription: String {
@@ -173,6 +219,10 @@ public struct DaveDiagnostics: Codable, Sendable, CustomDebugStringConvertible {
           Roster Members: \(rosterMemberCount)
           Unrecognized Roster Members: \(unrecognizedRosterMemberCount)
           Evicted Transitions: \(evictedTransitionCount)
+          Staged Transitions: \(stagedTransitionCount)
+          Watchdog: \(watchdogSummary)
+          Last Failure: \(lastFailure.map { "\($0.code.rawValue) (\($0.origin.rawValue))" } ?? "None")
+          Trace Events: \(recentEvents.count)
           Last MLS Error: \(lastMlsError ?? "None")
           Last Transition Timestamp: \(timestampStr)
           Encryption Stats (Audio): \(statsStr)

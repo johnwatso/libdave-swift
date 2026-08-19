@@ -30,6 +30,7 @@ This package was developed to support **[`swiftbot`](https://github.com/johnwats
 * **Persistent Signature Identity:** Passing an `authSessionId` gives the session a persisted MLS signature key pair (stored under `$XDG_CONFIG_HOME`/`~/.config` in `Discord Key Storage/`, with the directory tightened to `0700`), so the client keeps a stable identity across reconnects — matching official Discord clients. Passing `nil` uses a fresh ephemeral identity per session. See [SECURITY.md](SECURITY.md) for the identity lifecycle.
 * **Full-Duplex Media:** The coordinator handles both directions — `encryptDiscordAudioFrame` for outbound audio and `decryptDiscordAudioFrame(_:from:)` for inbound, with one decryptor per remote speaker kept in step with the MLS roster after every welcome/commit.
 * **Discord Action Flow:** Coordinator helpers emit typed outbound actions for Discord Voice gateway messages such as MLS key packages, commit/welcome payloads, transition-ready, and invalid commit/welcome recovery.
+* **Observability:** `DaveDiagnostics` carries a bounded, exportable trace of recent state-machine events, and `diagnosticEvents()` streams the same events live as an `AsyncStream`. Both are tagged with the session generation so a host can discard events from a session it has already replaced, both carry structured failure codes rather than only human-readable text, and neither ever contains MLS payloads, ratchets, or key material — a payload appears only as a byte count.
 * **Recovery Diagnostics:** Typed recovery hints, external sender state, pending epoch/transition tracking, and a monotonic media-readiness watchdog make stalled DAVE transitions visible without parsing logs. The watchdog deadline is immune to wall-clock jumps and sleep/wake.
 * **Built for Long Sessions:** The replay ledger and staged-transition window age out oldest-first rather than failing the session when they fill, while never evicting live state or actions the host has not acknowledged. Native callback contexts and replaced key ratchets are reclaimed on a grace window instead of accumulating for the lifetime of the process.
 * **Roster Verification:** Every applied transition reports the MLS roster and, against the participants Discord announced, any member that was never recognized — with signatures and the epoch authenticator available for identity verification UI. `DaveCoordinatorLimits.unrecognizedRosterMemberPolicy` chooses between reporting it and failing the session closed.
@@ -140,6 +141,20 @@ announced, which is the case end-to-end encryption exists to make visible.
 if !transition.unrecognizedRosterUserIds.isEmpty {
     // Surface this to the user; configure `.failClosed` to stop media instead.
     logger.warning("unannounced group members: \(transition.unrecognizedRosterUserIds)")
+}
+```
+
+To observe a session, subscribe to the event stream, or read the trace from any
+`DaveDiagnostics` snapshot after the fact:
+
+```swift
+Task {
+    for await event in await coordinator.diagnosticEvents() {
+        logger.debug("[gen \(event.sessionGeneration)] \(event.kind) \(event.outcome)")
+        if let failure = event.failure {
+            logger.error("DAVE failure \(failure.code) from \(failure.origin)")
+        }
+    }
 }
 ```
 

@@ -17,6 +17,14 @@ import CDave
 /// the grace window would mean the C library invoked a context for an object
 /// it destroyed tens of seconds earlier — far outside anything it does today.
 ///
+/// The bundled framework in fact delivers every callback synchronously, on the
+/// calling thread, within a native call — measured and asserted by
+/// `NativeCallbackContractTests`. That would permit immediate release, but the
+/// grace window is kept because the *contract* in `dave.h` promises none of it,
+/// and because a host that violates the documented serialization requirement
+/// would otherwise turn a teardown race into a use-after-free rather than an
+/// inert no-op. See `Docs/NATIVE_CALLBACK_CONTRACT.md`.
+///
 /// Reclaiming matters because registrations are not rare: one per session,
 /// one per rebuilt encryptor, and one per pairwise-fingerprint request. A
 /// long-running voice client that reconnects and verifies identities would

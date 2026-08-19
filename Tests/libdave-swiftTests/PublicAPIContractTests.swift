@@ -22,7 +22,7 @@ final class PublicAPIContractTests: XCTestCase {
             pendingTransitionId: 42,
             activeTransitionId: 41,
             pendingTransitionIds: [42, 43],
-            externalSenderState: .registered,
+            externalSenderState: .submitted,
             lastRecoveryAction: .pauseMedia,
             hasIssuedInitialKeyPackage: true,
             hasSentInitialKeyPackage: true,
@@ -46,7 +46,7 @@ final class PublicAPIContractTests: XCTestCase {
         XCTAssertEqual(decoded.pendingTransitionId, 42)
         XCTAssertEqual(decoded.activeTransitionId, 41)
         XCTAssertEqual(decoded.pendingTransitionIds, [42, 43])
-        XCTAssertEqual(decoded.externalSenderState, .registered)
+        XCTAssertEqual(decoded.externalSenderState, .submitted)
         XCTAssertEqual(decoded.lastRecoveryAction, .pauseMedia)
         XCTAssertTrue(decoded.hasIssuedInitialKeyPackage)
         XCTAssertTrue(decoded.hasSentInitialKeyPackage)
