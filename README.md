@@ -113,3 +113,14 @@ The MLS fixture harness needs genuine, safe-to-share artifacts; see its [fixture
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
 - [Migration guide](Docs/MIGRATING_TO_2.0.md)
+
+## License
+
+The Swift source in this repository is MIT licensed — see [LICENSE](LICENSE).
+
+That license does **not** extend to `Frameworks/Dave.xcframework`, which bundles
+third-party components (Discord libdave, mlspp, OpenSSL/libcrypto) under their own
+terms. Their exact revisions and license texts were not recorded when the archive
+was built; [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) documents what the
+artifact does and does not establish, and how to close that gap on the next
+framework rebuild.
