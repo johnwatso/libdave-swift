@@ -4,6 +4,32 @@ All notable changes to `libdave-swift` are documented here. The version is the
 SemVer Git tag (for example, `1.3.1`); `Package.swift` intentionally does not
 carry a second, independently mutable version number.
 
+## [3.0.1] - 2026-08-22
+
+### Fixed
+
+- **A synchronous native MLS proposal failure now requests immediate session
+  recreation.** `DaveSessionCoordinator.processProposals` previously converted
+  a missing native commit/welcome result into `DaveError.invalidState`, whose
+  `retryLater` recovery hint could lead a host to send the following Commit to
+  the already failed native MLS session. Proposal processing now fails the
+  coordinator closed immediately and throws `DaveError.sessionFailed`, whose
+  recovery hint is `recreateSession`.
+- Native proposal-failure diagnostics retain the native source and reason under
+  the existing `proposalsProcessingFailed` code. Fail-closed teardown is
+  idempotent for a session generation, so a delayed copy of the callback or a
+  later gateway event cannot overwrite the original cause.
+- Commit and Welcome events received after the proposal failure stop at the
+  coordinator's failed-state guard and never reach the dead native session.
+
+### Validation
+
+- Added a focused native-failure seam and regression test covering recovery
+  classification, diagnostic preservation, exactly-once fail-closed behavior,
+  and rejection of later Commit and Welcome events without fabricated MLS
+  bytes.
+- The bundled `Dave.xcframework` is unchanged in this release.
+
 ## [3.0.0] - 2026-08-19
 
 ### Release recommendation

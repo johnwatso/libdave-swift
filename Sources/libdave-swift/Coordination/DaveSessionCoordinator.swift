@@ -71,6 +71,10 @@ public actor DaveSessionCoordinator {
 
     // Lifecycles owned by actor
     private var session: DaveSession?
+    /// One-shot seam used by regression tests to model the native failure
+    /// callback/result pair without fabricating MLS wire bytes. Production
+    /// code always leaves this unset and calls the bundled native session.
+    private var nextProposalFailureForTesting: (source: String, reason: String)?
     private var encryptor: DaveEncryptor?
     /// Ratchet installed on `encryptor` and currently used to encrypt outbound
     /// media. This is retained independently of `session`, whose MLS state may
@@ -259,6 +263,7 @@ public actor DaveSessionCoordinator {
         transitionLedgerOrder.removeAll()
         pendingOutboundActions.removeAll()
         pendingOutboundActionOrder.removeAll()
+        nextProposalFailureForTesting = nil
 
         // Clear tracking state
         appliedTransitionCount = 0
@@ -1159,8 +1164,40 @@ public actor DaveSessionCoordinator {
         // Discord supplies the expected participants here as well as with a
         // Welcome; keep the verification baseline current either way.
         recognizedRosterUserIds = Set(recognizedUserIds)
-        guard let result = session.processProposals(proposals, recognizedUserIds: recognizedUserIds) else {
-            throw DaveError.invalidState(message: "Proposals processing failed\(nativeFailureSuffix(session))")
+        let result: Data?
+        let nativeFailure: (source: String, reason: String)?
+        if let injectedFailure = nextProposalFailureForTesting {
+            nextProposalFailureForTesting = nil
+            result = nil
+            nativeFailure = injectedFailure
+        } else {
+            result = session.processProposals(proposals, recognizedUserIds: recognizedUserIds)
+            // The bundled library delivers this callback synchronously. Drain
+            // it even if native also returned bytes: a reported MLS failure is
+            // terminal for this session and output from that call is unsafe.
+            nativeFailure = session.takeLastMLSFailure()
+        }
+
+        if let nativeFailure {
+            failClosed(
+                reason: "Proposal processing failed: \(nativeFailure.source): \(nativeFailure.reason)",
+                code: .proposalsProcessingFailed,
+                origin: .nativeMls,
+                nativeSource: nativeFailure.source,
+                nativeReason: nativeFailure.reason
+            )
+            throw DaveError.sessionFailed
+        }
+        guard let result else {
+            // The C API has no separate status value. For a non-empty proposal
+            // payload, absence of its required commit/welcome output is the
+            // only synchronous signal that the native operation failed.
+            failClosed(
+                reason: "Native MLS proposal processing returned no commit/welcome payload",
+                code: .proposalsProcessingFailed,
+                origin: .nativeMls
+            )
+            throw DaveError.sessionFailed
         }
         try validateMlsPayload(result, kind: "commit/welcome")
         lastRecoveryAction = .processProposals
@@ -1420,6 +1457,12 @@ public actor DaveSessionCoordinator {
     /// verification compares against.
     internal func setRecognizedRosterForTesting(_ userIds: [String]) {
         recognizedRosterUserIds = Set(userIds)
+    }
+
+    /// Makes the next proposal call behave like a synchronous native MLS
+    /// failure. The supplied proposal bytes are not forwarded to native code.
+    internal func failNextProposalProcessingForTesting(source: String, reason: String) {
+        nextProposalFailureForTesting = (source, reason)
     }
 
     /// Evidence for the serialization guarantee this type advertises.
@@ -2270,6 +2313,12 @@ public actor DaveSessionCoordinator {
         nativeSource: String? = nil,
         nativeReason: String? = nil
     ) {
+        // Preserve the first terminal cause and emit one fail-closed event for
+        // this generation. Later gateway messages are rejected by
+        // ensureAcceptingGatewayEvents() and must not overwrite diagnostics or
+        // repeatedly tear down state that is already dead.
+        guard handshakeState != .failed else { return }
+
         encryptorGeneration &+= 1
         encryptor = nil
         activeOutboundRatchet = nil

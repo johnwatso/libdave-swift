@@ -29,7 +29,7 @@ Add a tagged release to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/johnwatso/libdave-swift.git", exact: "3.0.0")
+    .package(url: "https://github.com/johnwatso/libdave-swift.git", exact: "3.0.1")
 ]
 ```
 
