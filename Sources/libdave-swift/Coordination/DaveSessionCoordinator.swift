@@ -867,7 +867,9 @@ public actor DaveSessionCoordinator {
         self.pendingEpoch = pendingEpoch
         mediaReadinessWatchdogStartedAt = .now
         mediaReadinessWatchdogStartedDate = Date()
-        mediaReadinessWatchdogTimeout = max(0, timeout ?? limits.mediaReadinessTimeout)
+        mediaReadinessWatchdogTimeout = Self.normalizedWatchdogTimeout(
+            timeout ?? limits.mediaReadinessTimeout
+        )
         mediaReadinessWatchdogReason = reason
         mediaReadinessWatchdogExpiry = nil
         lastRecoveryAction = .pauseMedia
@@ -1521,7 +1523,10 @@ public actor DaveSessionCoordinator {
     /// - Parameter bufferSize: Events buffered before the oldest are dropped.
     ///   Defaults to ``DaveCoordinatorLimits/diagnosticEventBufferSize``.
     public func diagnosticEvents(bufferSize: Int? = nil) -> AsyncStream<DaveDiagnosticEvent> {
-        let capacity = max(1, bufferSize ?? limits.diagnosticEventBufferSize)
+        let capacity = min(
+            max(1, bufferSize ?? limits.diagnosticEventBufferSize),
+            DaveCoordinatorLimits.maximumDiagnosticEventBufferSize
+        )
         let id = UUID()
         return AsyncStream(
             DaveDiagnosticEvent.self,
@@ -1639,7 +1644,7 @@ public actor DaveSessionCoordinator {
             try applyRoster(welcomeResult.rosterMemberIds) {
                 welcomeResult.getRosterMemberSignature(rosterId: $0)
             }
-            synchronizeDecryptors(rosterMemberIds: welcomeResult.rosterMemberIds)
+            synchronizeDecryptorsForCurrentRoster()
             appliedTransitionCount &+= 1
             handshakeState = .ready
             lastMlsError = nil
@@ -1676,11 +1681,10 @@ public actor DaveSessionCoordinator {
             if encryptor == nil {
                 try rebuildEncryptor()
             }
-            try validateRosterCount(commitResult.rosterMemberIds.count)
-            try applyRoster(commitResult.rosterMemberIds) {
+            try applyRosterDelta(commitResult.rosterMemberIds) {
                 commitResult.getRosterMemberSignature(rosterId: $0)
             }
-            synchronizeDecryptors(rosterMemberIds: commitResult.rosterMemberIds)
+            synchronizeDecryptorsForCurrentRoster()
             appliedTransitionCount &+= 1
             handshakeState = .ready
             lastMlsError = nil
@@ -2212,6 +2216,38 @@ public actor DaveSessionCoordinator {
         }
         rosterMemberSignatures = signatures
 
+        try verifyCurrentRoster()
+    }
+
+    /// Applies libdave's commit roster change-map. Entries with signatures are
+    /// additions or updates; entries without signatures are removals.
+    internal func applyRosterDelta(
+        _ changedMemberIds: [UInt64],
+        signature: @Sendable (UInt64) -> Data?
+    ) throws {
+        var members = Set(rosterUserIds)
+        var signatures = rosterMemberSignatures
+
+        for memberId in changedMemberIds {
+            let userId = String(memberId)
+            if let memberSignature = signature(memberId) {
+                members.insert(userId)
+                signatures[userId] = memberSignature
+            } else {
+                members.remove(userId)
+                signatures[userId] = nil
+            }
+        }
+
+        try validateRosterCount(members.count)
+        rosterUserIds = members.sorted {
+            (UInt64($0) ?? 0) < (UInt64($1) ?? 0)
+        }
+        rosterMemberSignatures = signatures
+        try verifyCurrentRoster()
+    }
+
+    private func verifyCurrentRoster() throws {
         guard !recognizedRosterUserIds.isEmpty else {
             unrecognizedRosterUserIds = []
             return
@@ -2243,10 +2279,10 @@ public actor DaveSessionCoordinator {
     /// welcome/commit: users who left are dropped, remaining users transition
     /// to their ratchet for the new epoch. Users who joined get a decryptor
     /// lazily on their first decrypted frame.
-    private func synchronizeDecryptors(rosterMemberIds: [UInt64]) {
+    private func synchronizeDecryptorsForCurrentRoster() {
         guard let session else { return }
 
-        let rosterUserIds = Set(rosterMemberIds.map(String.init))
+        let rosterUserIds = Set(rosterUserIds)
         for userId in Array(decryptors.keys) {
             guard let decryptor = decryptors[userId] else { continue }
             guard rosterUserIds.contains(userId) else {
@@ -2431,7 +2467,9 @@ public actor DaveSessionCoordinator {
         if mediaReadinessWatchdogStartedAt == nil {
             mediaReadinessWatchdogStartedAt = .now
             mediaReadinessWatchdogStartedDate = Date()
-            mediaReadinessWatchdogTimeout = max(0, timeout ?? limits.mediaReadinessTimeout)
+            mediaReadinessWatchdogTimeout = Self.normalizedWatchdogTimeout(
+                timeout ?? limits.mediaReadinessTimeout
+            )
             mediaReadinessWatchdogReason = reason
             mediaReadinessWatchdogExpiry = nil
             scheduleMediaReadinessWatchdog()
@@ -2477,6 +2515,10 @@ public actor DaveSessionCoordinator {
     private static func seconds(_ duration: Duration) -> TimeInterval {
         let components = duration.components
         return TimeInterval(components.seconds) + TimeInterval(components.attoseconds) * 1e-18
+    }
+
+    private static func normalizedWatchdogTimeout(_ timeout: TimeInterval) -> TimeInterval {
+        timeout.isFinite ? max(0, timeout) : 0
     }
 
     private func expireMediaReadinessWatchdog(sessionGeneration: UInt64, startedAt: ContinuousClock.Instant) {

@@ -106,7 +106,12 @@ After reconnecting, use `pendingDiscordGatewayActions()` to resend unacknowledge
 swift test
 ```
 
-The MLS fixture harness needs genuine, safe-to-share artifacts; see its [fixture contract](Docs/MLS_INTEGRATION_FIXTURES.md). The bundled framework's inventory and checksums are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+`Scripts/build-native-framework.sh` rebuilds the pinned native stack and its
+test-only external sender. The resulting runtime integration test establishes
+and rekeys a real three-member MLS group and exchanges encrypted media; see the
+[integration contract](Docs/MLS_INTEGRATION_FIXTURES.md). Native versions,
+licenses, SBOM, and verification instructions are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## More
 
@@ -118,9 +123,7 @@ The MLS fixture harness needs genuine, safe-to-share artifacts; see its [fixture
 
 The Swift source in this repository is MIT licensed — see [LICENSE](LICENSE).
 
-That license does **not** extend to `Frameworks/Dave.xcframework`, which bundles
-third-party components (Discord libdave, mlspp, OpenSSL/libcrypto) under their own
-terms. Their exact revisions and license texts were not recorded when the archive
-was built; [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) documents what the
-artifact does and does not establish, and how to close that gap on the next
-framework rebuild.
+That license does **not** replace the licenses of third-party components bundled
+in `Frameworks/Dave.xcframework`. Their exact revisions and applicable license
+texts are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and in the
+framework's SPDX SBOM and `Licenses` directory.

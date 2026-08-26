@@ -1,6 +1,8 @@
 # Native Framework Provenance and Third-Party Inventory
 
-This is a checksum-backed, evidence-limited inventory for the committed `Dave.xcframework`. It is intentionally **not** presented as a complete source SBOM or a substitute for upstream license texts: the repository does not contain the upstream source revisions, dependency lockfiles, compiler command line, or license/notice files used to build the archive. Do not infer a component version or license from this document.
+The committed `Dave.xcframework` is built from immutable inputs by
+`Scripts/build-native-framework.sh`. Machine-readable build metadata, an SPDX
+2.3 SBOM, license texts, and file digests are shipped inside the framework.
 
 ## Shipped artifact
 
@@ -8,31 +10,56 @@ This is a checksum-backed, evidence-limited inventory for the committed `Dave.xc
 | --- | --- |
 | Framework | `Frameworks/Dave.xcframework` |
 | Platform/slice | macOS `arm64` only (`macos-arm64`) |
-| Package deployment target | macOS 26.0 (`Package.swift`) |
+| Deployment target | macOS 26.0 |
 | Static archive | `macos-arm64/libdave_merged.a` |
-| Archive SHA-256 | `70d60aff259d0785e24f316420cc9785e83607d766e32657d0a3029d5cf3e3ac` |
-| Last framework-changing commit | `336b481f17c9eeb880ecf2a793777b32f2976167` (2026-07-03) |
+| Archive SHA-256 | `f83079a354aa6ba00d68da155c21382a672e26fc4c4198a04392c577e7ec7e0d` |
+| Compiler | Xcode 26.6 (17F113) |
 
-All framework-file digests are in [`Frameworks/Dave.xcframework/SHA256SUMS`](Frameworks/Dave.xcframework/SHA256SUMS). Verify them from the repository root with:
+Verify every bundled file, its pinned inputs, architecture, and embedded
+OpenSSL version from the repository root:
 
 ```bash
-shasum -a 256 -c Frameworks/Dave.xcframework/SHA256SUMS
+Scripts/verify-native-provenance.sh
 ```
 
-## Component inventory
+## Native inputs
 
-| Component | Evidence in this repository | Version and license status |
+| Component | Immutable version | License |
 | --- | --- | --- |
-| Discord libdave | The last framework-changing commit says the archive was compiled from `discord/libdave`; archive members include `bindings_capi.cpp.o`, `encryptor.cpp.o`, `session.cpp.o`, and related DAVE objects. | Exact source revision and license text: **not recorded**. |
-| mlspp | The same commit records mlspp headers pinned by that project's vcpkg overlay; headers/symbols and archive members contain the `mlspp` namespace and MLS implementation object names. | Exact source revision and license text: **not recorded**. |
-| OpenSSL/libcrypto | The archive has `libcrypto-*` object members. | Exact OpenSSL release, build options, and license/notice text: **not recorded**. |
+| Discord libdave | tag `v1.1.1/cpp`, commit `52cd56dc550f447fb354b3a06c9e2d2e2a4309c6` | MIT |
+| Cisco mlspp | commit `1cc50a124a3bc4e143a787ec934280dc70c1034d` | BSD-2-Clause |
+| OpenSSL/libcrypto | 3.0.7 | Apache-2.0 |
+| nlohmann/json | 3.11.3#1 | MIT |
 
-The archive alone does not establish the exact versions or licenses of those components. A binary refresh must not reuse this table as a license assertion.
+Dependency resolution uses libdave's vcpkg submodule at
+`16c71a39e5a0fc0bdb3fad03beef8f38ee00ee3b` and its OpenSSL-3 manifest baseline
+`d07689ef165f033de5c0710e4f67c193a85373e1`. Build tooling is pinned in
+`Native/versions.env`; the script currently enforces Xcode 26.6 (17F113), CMake
+3.30.1, Ninja 1.12.1, and pkgconf 2.4.3.
 
-## Required workflow for a binary refresh
+The source license copies are in `ThirdPartyLicenses/` and duplicated under
+`Frameworks/Dave.xcframework/Licenses/`. The component inventory is available
+as `Frameworks/Dave.xcframework/SBOM.spdx.json`, while exact build metadata is
+in `Frameworks/Dave.xcframework/BUILD-METADATA.json`.
 
-1. Record the exact upstream repository URLs and immutable source revisions, plus the vcpkg manifest/lock or equivalent dependency resolution.
-2. Preserve the build script, Xcode/SDK version, architecture, and deployment target used to create the archive.
-3. Collect and commit the applicable upstream license and notice texts before distributing the refreshed framework.
-4. Regenerate `Frameworks/Dave.xcframework/SHA256SUMS`, update this inventory, and run the CI framework-integrity check.
-5. Produce a complete SPDX or CycloneDX SBOM from the locked source inputs. Until then, this inventory is deliberately limited to what the checked-in artifact proves.
+## Rebuilding
+
+On an Apple Silicon Mac with Xcode 26.6 or a deliberately reviewed successor:
+
+```bash
+Scripts/build-native-framework.sh
+DAVE_FRAMEWORK_ROOT="$PWD/.build/native-rebuild/output/Dave.xcframework" \
+  Scripts/verify-native-provenance.sh
+DAVE_EXTERNAL_SENDER_HELPER="$PWD/.build/native-rebuild/build/integration/dave_external_sender_helper" \
+  swift test --filter RuntimeMLSIntegrationTests
+```
+
+The build works in the dedicated `.build/native-rebuild` directory and checks
+out the exact libdave and vcpkg revisions on every run. The local patch enables
+libdave's generic persisted-key backend on Apple platforms and removes
+test-only dependency resolution from the production native manifest; it is
+validated against the pinned source before application.
+
+Before committing a refreshed artifact, copy the verified output into
+`Frameworks/Dave.xcframework`, rerun the default provenance verifier, and update
+this file if any recorded input or digest changed.

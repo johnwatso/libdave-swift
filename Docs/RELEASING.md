@@ -44,26 +44,26 @@ the release candidate commit:
 4. Validate the shipped binary exactly as consumers will receive it:
 
    ```sh
-   plutil -lint Frameworks/Dave.xcframework/Info.plist
-   shasum -a 256 -c Frameworks/Dave.xcframework/SHA256SUMS
-   lipo Frameworks/Dave.xcframework/macos-arm64/libdave_merged.a -archs
+   Scripts/verify-native-provenance.sh
    ```
 
-   The final command must report `arm64`. If the framework changed, regenerate
-   its checksum manifest and update [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)
-   with the available provenance; do not invent component versions or licenses.
+   This validates checksums, pinned build metadata, the `arm64` slice, and the
+   embedded OpenSSL version. If the framework changed, rebuild it with
+   `Scripts/build-native-framework.sh` and update the inventory, licenses, and
+   SBOM together.
 
-5. Run the real Voice gateway integration fixture described in
-   [MLS_INTEGRATION_FIXTURES.md](MLS_INTEGRATION_FIXTURES.md), if one is
-   available. Unit tests alone cannot validate unrelated MLS artifacts.
+5. Rebuild the immutable native inputs and run the live MLS loopback described
+   in [MLS_INTEGRATION_FIXTURES.md](MLS_INTEGRATION_FIXTURES.md):
 
-   No such fixture exists yet, and that document explains why a captured one
-   cannot cover the whole path: a Welcome is sealed to an HPKE init key that is
-   regenerated on every call and never persisted, so key ratchets, re-keys, and
-   encrypted media cannot be exercised from captured bytes. Until that gap is
-   closed, treat a release that changes the media or MLS transition paths as
-   unvalidated there, and verify it against a real client in a disposable Voice
-   channel before rolling it out.
+   ```sh
+   Scripts/build-native-framework.sh
+   DAVE_EXTERNAL_SENDER_HELPER="$PWD/.build/native-rebuild/build/integration/dave_external_sender_helper" \
+     swift test --filter RuntimeMLSIntegrationTests
+   ```
+
+   This is required for changes to MLS transitions, rosters, ratchets, or media.
+   A disposable real Voice-channel run remains valuable for gateway integration
+   changes that the external-sender protocol does not model.
 6. Confirm the CI build-and-test job has passed for the exact candidate SHA.
    Its consumer smoke test verifies that a fresh Swift package can link and run
    against the bundled framework.

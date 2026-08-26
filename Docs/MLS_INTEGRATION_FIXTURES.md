@@ -1,6 +1,25 @@
-# MLS Integration Fixture Contract
+# MLS Integration Test and Fixture Contract
 
-The unit tests cover wrapper and state-machine behavior, but a real encrypted DAVE integration test needs genuine, internally consistent MLS artifacts. Do not substitute random bytes: an external sender, key package, Welcome, Commit, roster, and ratchets are bound to one MLS group state.
+The native runtime test now creates genuine, internally consistent MLS
+artifacts in-process. Do not substitute random bytes: an external sender, key
+package, Welcome, Commit, roster, and ratchets are bound to one MLS group state.
+
+## Running the complete runtime path
+
+Build the pinned native framework and test-only external sender, then run the
+Swift integration test:
+
+```bash
+Scripts/build-native-framework.sh
+DAVE_EXTERNAL_SENDER_HELPER="$PWD/.build/native-rebuild/build/integration/dave_external_sender_helper" \
+  swift test --filter RuntimeMLSIntegrationTests
+```
+
+`RuntimeMLSIntegrationTests` establishes A and B through a live proposal,
+Commit, and Welcome; checks the complete roster, epoch authenticator, pairwise
+fingerprint, and encrypted audio; adds C in a second epoch; verifies C remains
+blocked until Execute; then proves A's rekeyed media decrypts at B and C. CI
+rebuilds the same immutable native inputs before running this test.
 
 ## Running a fixture
 
@@ -41,16 +60,10 @@ A captured fixture therefore verifies:
 It cannot verify key ratchet installation, re-keying, or encrypted media
 round-trips, because all three sit behind decrypting the Welcome.
 
-Closing that remaining gap needs one of:
-
-- **an in-process loopback**, by extending the C shim in the upstream C++
-  repository with test-only entry points that mint an external sender and its
-  proposals. Two clients can then be driven through a full join, re-key, and
-  media exchange with no captured data, and it runs in CI; or
-- **a live verification run** against a disposable Voice channel, asserting the
-  same properties in-process while the session is still alive. This exercises
-  the real path but produces nothing replayable, so it is a manual gate rather
-  than a regression test.
+The test-only external-sender executable closes that remaining cryptographic
+gap without adding test entry points to the shipped XCFramework. Captured
+fixtures remain useful for production gateway ordering and recovery sequences;
+they are complementary to, not a replacement for, the runtime loopback.
 
 ## Fixture inputs
 
@@ -67,9 +80,9 @@ Do not commit production guild IDs, account IDs, key packages, private keys, cre
 ## Required integration assertions
 
 1. Configure the coordinator with a numeric local Snowflake and register the captured external sender.
-2. Send the emitted key package into the fixture harness, apply the corresponding Welcome or Commit, and verify that a key ratchet is installed.
-3. Confirm media remains blocked until the matching Execute Transition, then verify encrypted outbound and inbound frame processing.
-4. Apply a second transition and verify that both directions re-key; exercise invalid-transition recovery as a separate fixture.
+2. Send the emitted key package to the live external sender, apply the corresponding Welcome or Commit, and verify that a key ratchet is installed.
+3. Confirm a joining member remains blocked until the matching Execute Transition, then verify encrypted outbound and inbound frame processing.
+4. Apply a second transition and verify that members re-key; exercise invalid-transition recovery as a separate fixture.
 5. Verify that reset/recovery drops old cryptors and that an old native callback cannot change the replacement session's state.
 
 ## External-sender validation boundary

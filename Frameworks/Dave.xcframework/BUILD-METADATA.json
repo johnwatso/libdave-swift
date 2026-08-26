@@ -1,0 +1,39 @@
+{
+  "cmake": {
+    "version": "3.30.1"
+  },
+  "libdave": {
+    "repository": "https://github.com/discord/libdave.git",
+    "revision": "52cd56dc550f447fb354b3a06c9e2d2e2a4309c6",
+    "tag": "v1.1.1/cpp"
+  },
+  "mlspp": {
+    "revision": "1cc50a124a3bc4e143a787ec934280dc70c1034d"
+  },
+  "ninja": {
+    "version": "1.12.1"
+  },
+  "nlohmannJson": {
+    "version": "3.11.3"
+  },
+  "openssl": {
+    "version": "3.0.7"
+  },
+  "pkgconf": {
+    "version": "2.4.3"
+  },
+  "schemaVersion": 1,
+  "target": {
+    "architecture": "arm64",
+    "deploymentTarget": "26.0",
+    "platform": "macOS"
+  },
+  "vcpkg": {
+    "builtinBaseline": "d07689ef165f033de5c0710e4f67c193a85373e1",
+    "revision": "16c71a39e5a0fc0bdb3fad03beef8f38ee00ee3b"
+  },
+  "xcode": {
+    "buildVersion": "17F113",
+    "version": "26.6"
+  }
+}

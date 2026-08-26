@@ -97,7 +97,10 @@ public final class DaveCommitResult: @unchecked Sendable {
         return daveCommitResultIsIgnored(handle)
     }
 
-    /// Lists the member IDs in the roster after this commit.
+    /// Lists roster changes produced by this commit.
+    ///
+    /// An ID with a non-empty signature was added or updated. An ID whose
+    /// signature is `nil` was removed. This is a delta, not the full roster.
     public var rosterMemberIds: [UInt64] {
         guard let handle = handle else { return [] }
         var rosterIdsPtr: UnsafeMutablePointer<UInt64>? = nil
@@ -109,7 +112,9 @@ public final class DaveCommitResult: @unchecked Sendable {
         return Array(UnsafeBufferPointer(start: ptr, count: length))
     }
 
-    /// Retrieves the signature of a roster member.
+    /// Retrieves the signature for an added or updated roster member.
+    ///
+    /// A `nil` signature identifies a removal in the commit's roster delta.
     public func getRosterMemberSignature(rosterId: UInt64) -> Data? {
         guard let handle = handle else { return nil }
         var signaturePtr: UnsafeMutablePointer<UInt8>? = nil

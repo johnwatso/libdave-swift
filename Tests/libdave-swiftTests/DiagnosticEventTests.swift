@@ -444,6 +444,12 @@ final class DiagnosticEventTests: XCTestCase {
         XCTAssertEqual(DaveError.notConfigured.failureOrigin, .wrapper)
     }
 
+    func testCreationFailuresHaveDistinctMachineReadableCodes() {
+        XCTAssertEqual(DaveError.sessionCreationFailed.failureCode, .sessionUnavailable)
+        XCTAssertEqual(DaveError.encryptorCreationFailed.failureCode, .encryptorUnavailable)
+        XCTAssertEqual(DaveError.decryptorCreationFailed.failureCode, .decryptorUnavailable)
+    }
+
     /// Diagnostics are shipped to monitoring pipelines, so the whole structure
     /// must round-trip and stay free of secret material.
     func testExpandedDiagnosticsRoundTripThroughCodable() async throws {

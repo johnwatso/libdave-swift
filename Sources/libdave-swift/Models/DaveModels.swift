@@ -171,25 +171,44 @@ public enum DaveRosterVerificationPolicy: String, Codable, Sendable {
 /// allocation or native parse attempt. Hosts with a known smaller deployment
 /// may lower them further.
 public struct DaveCoordinatorLimits: Sendable, Equatable, Codable {
-    public var maximumMlsPayloadBytes: Int
-    public var maximumRosterMembers: Int
-    public var maximumMediaFrameBytes: Int
-    public var maximumTrackedTransitions: Int
-    public var maximumPendingOutboundActions: Int
+    public var maximumMlsPayloadBytes: Int {
+        didSet { maximumMlsPayloadBytes = Self.positive(maximumMlsPayloadBytes) }
+    }
+    public var maximumRosterMembers: Int {
+        didSet { maximumRosterMembers = Self.positive(maximumRosterMembers) }
+    }
+    public var maximumMediaFrameBytes: Int {
+        didSet { maximumMediaFrameBytes = Self.positive(maximumMediaFrameBytes) }
+    }
+    public var maximumTrackedTransitions: Int {
+        didSet { maximumTrackedTransitions = Self.positive(maximumTrackedTransitions) }
+    }
+    public var maximumPendingOutboundActions: Int {
+        didSet { maximumPendingOutboundActions = Self.positive(maximumPendingOutboundActions) }
+    }
     /// Default seconds a transition may stay un-executed before the media
     /// readiness watchdog fails the session closed. Individual calls may still
     /// pass an explicit timeout.
-    public var mediaReadinessTimeout: TimeInterval
+    public var mediaReadinessTimeout: TimeInterval {
+        didSet { mediaReadinessTimeout = Self.watchdogTimeout(mediaReadinessTimeout) }
+    }
     /// How an MLS roster member the host never recognized is handled.
     public var unrecognizedRosterMemberPolicy: DaveRosterVerificationPolicy
     /// State-machine events kept in the bounded diagnostic trace reported by
     /// ``DaveDiagnostics/recentEvents``. Older events are dropped first.
-    public var traceEventCapacity: Int
+    public var traceEventCapacity: Int {
+        didSet { traceEventCapacity = Self.traceCapacity(traceEventCapacity) }
+    }
     /// Events buffered per live subscriber of
     /// ``DaveSessionCoordinator/diagnosticEvents(bufferSize:)`` before the
     /// oldest are dropped. A slow consumer degrades its own stream rather than
     /// growing memory or stalling the coordinator.
-    public var diagnosticEventBufferSize: Int
+    public var diagnosticEventBufferSize: Int {
+        didSet { diagnosticEventBufferSize = Self.diagnosticBufferCapacity(diagnosticEventBufferSize) }
+    }
+
+    internal static let maximumTraceEventCapacity = 2_000
+    internal static let maximumDiagnosticEventBufferSize = 4_096
 
     public init(
         maximumMlsPayloadBytes: Int = 1_048_576,
@@ -202,16 +221,56 @@ public struct DaveCoordinatorLimits: Sendable, Equatable, Codable {
         traceEventCapacity: Int = 200,
         diagnosticEventBufferSize: Int = 256
     ) {
-        self.maximumMlsPayloadBytes = max(1, maximumMlsPayloadBytes)
-        self.maximumRosterMembers = max(1, maximumRosterMembers)
-        self.maximumMediaFrameBytes = max(1, maximumMediaFrameBytes)
-        self.maximumTrackedTransitions = max(1, maximumTrackedTransitions)
-        self.maximumPendingOutboundActions = max(1, maximumPendingOutboundActions)
-        self.mediaReadinessTimeout = max(0, mediaReadinessTimeout)
+        self.maximumMlsPayloadBytes = Self.positive(maximumMlsPayloadBytes)
+        self.maximumRosterMembers = Self.positive(maximumRosterMembers)
+        self.maximumMediaFrameBytes = Self.positive(maximumMediaFrameBytes)
+        self.maximumTrackedTransitions = Self.positive(maximumTrackedTransitions)
+        self.maximumPendingOutboundActions = Self.positive(maximumPendingOutboundActions)
+        self.mediaReadinessTimeout = Self.watchdogTimeout(mediaReadinessTimeout)
         self.unrecognizedRosterMemberPolicy = unrecognizedRosterMemberPolicy
         // A trace is a diagnostic aid, never a reason to grow without bound.
-        self.traceEventCapacity = min(max(0, traceEventCapacity), 2_000)
-        self.diagnosticEventBufferSize = min(max(1, diagnosticEventBufferSize), 4_096)
+        self.traceEventCapacity = Self.traceCapacity(traceEventCapacity)
+        self.diagnosticEventBufferSize = Self.diagnosticBufferCapacity(diagnosticEventBufferSize)
+    }
+
+    /// Decoding must pass through the same normalization as direct
+    /// construction. Synthesized `Decodable` initialization writes stored
+    /// properties directly, bypassing property observers and allowing a saved
+    /// zero/negative transition limit or an effectively unbounded trace.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            maximumMlsPayloadBytes: try container.decode(Int.self, forKey: .maximumMlsPayloadBytes),
+            maximumRosterMembers: try container.decode(Int.self, forKey: .maximumRosterMembers),
+            maximumMediaFrameBytes: try container.decode(Int.self, forKey: .maximumMediaFrameBytes),
+            maximumTrackedTransitions: try container.decode(Int.self, forKey: .maximumTrackedTransitions),
+            maximumPendingOutboundActions: try container.decode(Int.self, forKey: .maximumPendingOutboundActions),
+            mediaReadinessTimeout: try container.decode(TimeInterval.self, forKey: .mediaReadinessTimeout),
+            unrecognizedRosterMemberPolicy: try container.decode(
+                DaveRosterVerificationPolicy.self,
+                forKey: .unrecognizedRosterMemberPolicy
+            ),
+            traceEventCapacity: try container.decode(Int.self, forKey: .traceEventCapacity),
+            diagnosticEventBufferSize: try container.decode(Int.self, forKey: .diagnosticEventBufferSize)
+        )
+    }
+
+    private static func positive(_ value: Int) -> Int {
+        max(1, value)
+    }
+
+    private static func watchdogTimeout(_ value: TimeInterval) -> TimeInterval {
+        // `Duration.seconds(.infinity)` traps. A non-finite watchdog value must
+        // therefore fail closed immediately rather than crashing the process.
+        value.isFinite ? max(0, value) : 0
+    }
+
+    private static func traceCapacity(_ value: Int) -> Int {
+        min(max(0, value), maximumTraceEventCapacity)
+    }
+
+    private static func diagnosticBufferCapacity(_ value: Int) -> Int {
+        min(max(1, value), maximumDiagnosticEventBufferSize)
     }
 
     public static let `default` = DaveCoordinatorLimits()
@@ -497,8 +556,12 @@ public enum DaveError: Error, LocalizedError, Sendable {
     /// rather than parsing `localizedDescription`.
     public var failureCode: DaveFailureCode {
         switch self {
-        case .sessionCreationFailed, .encryptorCreationFailed, .decryptorCreationFailed:
+        case .sessionCreationFailed:
+            return .sessionUnavailable
+        case .encryptorCreationFailed:
             return .encryptorUnavailable
+        case .decryptorCreationFailed:
+            return .decryptorUnavailable
         case .handshakeFailed:
             return .commitProcessingFailed
         case .protocolMismatch, .unsupportedProtocolVersion:

@@ -1,0 +1,41 @@
+diff --git a/cpp/CMakeLists.txt b/cpp/CMakeLists.txt
+index f55a7d8..a20f8af 100644
+--- a/cpp/CMakeLists.txt
++++ b/cpp/CMakeLists.txt
+@@ -9,6 +9,7 @@ project(
+ option(REQUIRE_BORINGSSL "Require BoringSSL instead of OpenSSL" OFF)
+ option(TESTING "Build tests" OFF)
+ option(PERSISTENT_KEYS "Enable storage of persistent signature keys" OFF)
++option(PERSISTENT_KEYS_GENERIC "Use the portable file-backed persistent key store on Apple platforms" OFF)
+ option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
+ option(ENABLE_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
+ option(INSTALL_VCPKG_LICENSES "Installs license files from vcpkg deps which require it" OFF)
+@@ -120 +121 @@ if (PERSISTENT_KEYS)
+-  if (APPLE)
++  if (APPLE AND NOT PERSISTENT_KEYS_GENERIC)
+@@ -198 +199 @@
+-if (APPLE AND PERSISTENT_KEYS)
++if (APPLE AND PERSISTENT_KEYS AND NOT PERSISTENT_KEYS_GENERIC)
+diff --git a/cpp/vcpkg-alts/openssl_3/vcpkg.json b/cpp/vcpkg-alts/openssl_3/vcpkg.json
+index 450d8d5..d5e7fd8 100644
+--- a/cpp/vcpkg-alts/openssl_3/vcpkg.json
++++ b/cpp/vcpkg-alts/openssl_3/vcpkg.json
+@@ -7,7 +7,6 @@
+       "name": "openssl",
+       "version>=": "3.0.7"
+     },
+-    "gtest",
+     "mlspp"
+   ],
+   "builtin-baseline": "d07689ef165f033de5c0710e4f67c193a85373e1",
+diff --git a/cpp/vcpkg-alts/openssl_3/overlay-ports/mlspp/vcpkg.json b/cpp/vcpkg-alts/openssl_3/overlay-ports/mlspp/vcpkg.json
+index 7ced919..b5db6bd 100644
+--- a/cpp/vcpkg-alts/openssl_3/overlay-ports/mlspp/vcpkg.json
++++ b/cpp/vcpkg-alts/openssl_3/overlay-ports/mlspp/vcpkg.json
+@@ -8,6 +8,5 @@
+         "version>=": "3.0.7"
+       },
+-      "catch2",
+       "nlohmann-json",
+       {
+         "name": "vcpkg-cmake",

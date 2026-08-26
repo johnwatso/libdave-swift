@@ -22,12 +22,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Verify bundled framework integrity and architecture
-        run: |
-          set -euo pipefail
-          plutil -lint Frameworks/Dave.xcframework/Info.plist
-          shasum -a 256 -c Frameworks/Dave.xcframework/SHA256SUMS
-          archive=Frameworks/Dave.xcframework/macos-arm64/libdave_merged.a
-          test "$(lipo "$archive" -archs)" = "arm64"
+        run: Scripts/verify-native-provenance.sh
 
       - name: Swift version
         run: swift --version
@@ -125,11 +120,34 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1
         run: swift test --sanitize=thread -Xswiftc -DDAVE_DEFAULT_ACTOR_EXECUTOR
 
+  native-integration:
+    # Captured Welcome bytes are bound to an ephemeral HPKE key package and
+    # cannot exercise a later checkout. Rebuild the pinned native inputs and
+    # use the resulting test-only external sender to generate a live,
+    # internally consistent three-member MLS session for the Swift wrapper.
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Rebuild pinned native framework and integration helper
+        run: Scripts/build-native-framework.sh
+
+      - name: Verify rebuilt framework provenance
+        env:
+          DAVE_FRAMEWORK_ROOT: ${{ github.workspace }}/.build/native-rebuild/output/Dave.xcframework
+        run: Scripts/verify-native-provenance.sh
+
+      - name: Run real MLS join, rekey, and media round trip
+        env:
+          DAVE_EXTERNAL_SENDER_HELPER: ${{ github.workspace }}/.build/native-rebuild/build/integration/dave_external_sender_helper
+        run: swift test --filter RuntimeMLSIntegrationTests
+
   verify-release-metadata:
     # A Swift package's release version is its Git tag. Refuse a release tag
     # that is not a plain SemVer version or has no corresponding release notes.
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-and-test, sanitizers]
+    needs: [build-and-test, sanitizers, native-integration]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

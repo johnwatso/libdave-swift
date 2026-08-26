@@ -87,6 +87,7 @@ public enum DaveFailureOrigin: String, Codable, Sendable {
 /// Hosts should branch on this rather than parsing human-readable text, which
 /// is not a stable interface.
 public enum DaveFailureCode: String, Codable, Sendable {
+    case sessionUnavailable
     case externalSenderRejected
     case externalSenderConflict
     case externalSenderMissing
@@ -95,6 +96,7 @@ public enum DaveFailureCode: String, Codable, Sendable {
     case proposalsProcessingFailed
     case keyRatchetUnavailable
     case encryptorUnavailable
+    case decryptorUnavailable
     case transitionConflict
     case watchdogExpired
     case protocolVersionRejected

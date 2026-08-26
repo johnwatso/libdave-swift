@@ -1,0 +1,122 @@
+{
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "creationInfo": {
+    "created": "2026-08-26T00:00:00Z",
+    "creators": [
+      "Tool: libdave-swift reproducible native build"
+    ]
+  },
+  "dataLicense": "CC0-1.0",
+  "documentDescribes": [
+    "SPDXRef-DaveFramework"
+  ],
+  "documentNamespace": "https://github.com/johnwatso/libdave-swift/sbom/dave-framework-52cd56dc",
+  "name": "Dave.xcframework native dependency SBOM",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-DaveFramework",
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT AND BSD-2-Clause AND Apache-2.0",
+      "licenseDeclared": "NOASSERTION",
+      "name": "Dave.xcframework",
+      "supplier": "Organization: libdave-swift"
+    },
+    {
+      "SPDXID": "SPDXRef-libdave",
+      "copyrightText": "Copyright (c) 2024 Discord",
+      "downloadLocation": "git+https://github.com/discord/libdave.git@52cd56dc550f447fb354b3a06c9e2d2e2a4309c6",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:github/discord/libdave@52cd56dc550f447fb354b3a06c9e2d2e2a4309c6",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "discord/libdave",
+      "supplier": "Organization: Discord",
+      "versionInfo": "v1.1.1/cpp (52cd56dc550f447fb354b3a06c9e2d2e2a4309c6)"
+    },
+    {
+      "SPDXID": "SPDXRef-mlspp",
+      "copyrightText": "Copyright (c) 2018, Cisco Systems",
+      "downloadLocation": "git+https://github.com/cisco/mlspp.git@1cc50a124a3bc4e143a787ec934280dc70c1034d",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:github/cisco/mlspp@1cc50a124a3bc4e143a787ec934280dc70c1034d",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseConcluded": "BSD-2-Clause",
+      "licenseDeclared": "BSD-2-Clause",
+      "name": "cisco/mlspp",
+      "supplier": "Organization: Cisco Systems",
+      "versionInfo": "1cc50a124a3bc4e143a787ec934280dc70c1034d"
+    },
+    {
+      "SPDXID": "SPDXRef-OpenSSL",
+      "copyrightText": "Copyright (c) 1998-2022 The OpenSSL Project",
+      "downloadLocation": "https://github.com/openssl/openssl/archive/openssl-3.0.7.tar.gz",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:generic/openssl@3.0.7",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "name": "OpenSSL libcrypto",
+      "supplier": "Organization: OpenSSL Software Foundation",
+      "versionInfo": "3.0.7"
+    },
+    {
+      "SPDXID": "SPDXRef-nlohmann-json",
+      "copyrightText": "Copyright (c) 2013-2022 Niels Lohmann",
+      "downloadLocation": "https://github.com/nlohmann/json/archive/v3.11.3.tar.gz",
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceLocator": "pkg:github/nlohmann/json@v3.11.3",
+          "referenceType": "purl"
+        }
+      ],
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "nlohmann/json",
+      "supplier": "Person: Niels Lohmann",
+      "versionInfo": "3.11.3"
+    }
+  ],
+  "relationships": [
+    {
+      "relatedSpdxElement": "SPDXRef-libdave",
+      "relationshipType": "CONTAINS",
+      "spdxElementId": "SPDXRef-DaveFramework"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-mlspp",
+      "relationshipType": "CONTAINS",
+      "spdxElementId": "SPDXRef-DaveFramework"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-OpenSSL",
+      "relationshipType": "CONTAINS",
+      "spdxElementId": "SPDXRef-DaveFramework"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-nlohmann-json",
+      "relationshipType": "CONTAINS",
+      "spdxElementId": "SPDXRef-DaveFramework"
+    }
+  ],
+  "spdxVersion": "SPDX-2.3"
+}

@@ -4,6 +4,52 @@ All notable changes to `libdave-swift` are documented here. The version is the
 SemVer Git tag (for example, `1.3.1`); `Package.swift` intentionally does not
 carry a second, independently mutable version number.
 
+## [4.0.0] - 2026-08-27
+
+### Release recommendation
+
+Publish this batch as a **major release**. `DaveFailureCode` gains public enum
+cases, so consumers with exhaustive switches must update even though the
+runtime changes are otherwise compatible.
+
+### Breaking
+
+- `DaveFailureCode` gains `sessionUnavailable` and `decryptorUnavailable`.
+  Creation failures no longer collapse into unrelated failure categories.
+
+### Fixed
+
+- **Commit roster updates are now applied as deltas.** libdave reports added or
+  changed members with signatures and removed members with empty signatures;
+  the coordinator previously replaced its complete roster with that change
+  map. A member-add commit could therefore make every existing member disappear
+  from diagnostics, verification, and decryptor synchronization.
+- `DaveCoordinatorLimits` now preserves its invariants after public property
+  mutation and Codable decoding, not only during initialization. Negative or
+  oversized values are normalized, trace and diagnostic buffers have hard
+  ceilings, and a non-finite media-readiness timeout no longer reaches the
+  trapping `Duration.seconds` conversion.
+- Session, encryptor, and decryptor construction failures now emit distinct,
+  machine-readable diagnostic codes.
+
+### Added
+
+- A pinned native rebuild pipeline for Discord libdave `v1.1.1/cpp`, mlspp,
+  OpenSSL, and vcpkg. The bundled XCFramework now includes exact build metadata,
+  license texts, an SPDX 2.3 SBOM, and checksum verification.
+- A live external-sender integration test that establishes a real MLS group,
+  verifies authenticators and fingerprints, exchanges encrypted audio, adds a
+  third member, stages Execute, rekeys, and decrypts at both receivers. CI
+  rebuilds the pinned C++ inputs before running it.
+
+### Validation
+
+- Added regression tests for roster-delta application, post-initialization
+  limit mutation, hostile Codable values, non-finite watchdog timeouts, bounded
+  diagnostics, and distinct native-construction failure codes.
+- Refreshed `Dave.xcframework`; archive SHA-256 is
+  `f83079a354aa6ba00d68da155c21382a672e26fc4c4198a04392c577e7ec7e0d`.
+
 ## [3.0.1] - 2026-08-22
 
 ### Fixed
